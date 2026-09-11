@@ -23,7 +23,7 @@ uikit = { path = "../UIKit" }
 corelocation = { path = "../CoreLocation" }
 
 [lib]
-crate-type = ["dylib"]
+crate-type = ["cdylib", "rlib"]
 
 [[example]]
 name = "maps_demo"
