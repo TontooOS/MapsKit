@@ -70,6 +70,67 @@ fn log_debug(message: &str) {
     }
 }
 
+/// Duration of one animated zoom step.
+const ZOOM_ANIM_DURATION: Duration = Duration::from_millis(200);
+
+/// Ease-out cubic: fast start, soft landing.
+fn ease_out_cubic(t: f64) -> f64 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Interpolates two coordinates, taking the shortest path around the
+/// antimeridian for longitude.
+fn lerp_coord(from: Coordinate, to: Coordinate, t: f64) -> Coordinate {
+    let t = t.clamp(0.0, 1.0);
+    let lat = from.latitude + (to.latitude - from.latitude) * t;
+    let dlon = (to.longitude - from.longitude + 540.0).rem_euclid(360.0) - 180.0;
+    let lon = (from.longitude + dlon * t + 180.0).rem_euclid(360.0) - 180.0;
+    Coordinate::new(lat, lon)
+}
+
+/// The coordinate under a screen point for an explicit camera and
+/// viewport size.
+fn screen_to_coord_at(
+    center: Coordinate,
+    zoom: f64,
+    width: f64,
+    height: f64,
+    x: f64,
+    y: f64,
+) -> Coordinate {
+    let z = zoom.round() as u8;
+    let scale = (zoom - f64::from(z)).exp2();
+    let (fx, fy) = tiles::tile_for(center, z);
+    let (cx, cy) = (fx * TILE_SIZE, fy * TILE_SIZE);
+    let origin_x = cx - width / 2.0;
+    let origin_y = cy - height / 2.0;
+    let wx = x / scale + origin_x;
+    let wy = y / scale + origin_y;
+    let n = f64::from(1u32 << z);
+    let lon = wx / TILE_SIZE / n * 360.0 - 180.0;
+    let lat = ((std::f64::consts::PI * (1.0 - 2.0 * wy / TILE_SIZE / n)).sinh())
+        .atan()
+        .to_degrees();
+    Coordinate::new(lat.clamp(-85.051_128_78, 85.051_128_78), lon)
+}
+
+/// One animated zoom step from camera A to camera B.
+struct ZoomAnim {
+    from_center: Coordinate,
+    from_zoom: f64,
+    to_center: Coordinate,
+    to_zoom: f64,
+    start: Instant,
+}
+
+impl ZoomAnim {
+    /// Linear progress in `0..=1`.
+    fn progress(&self, now: Instant) -> f64 {
+        (now.duration_since(self.start).as_secs_f64() / ZOOM_ANIM_DURATION.as_secs_f64())
+            .clamp(0.0, 1.0)
+    }
+}
+
 type AnnotationCallback = Arc<dyn Fn(&Annotation) + Send + Sync>;
 type CameraCallback = Arc<dyn Fn(&MapCamera) + Send + Sync>;
 
@@ -100,6 +161,8 @@ struct MapInner {
     width: f64,
     height: f64,
     offline: bool,
+    /// Running zoom animation, advanced every frame in `draw`.
+    zoom_anim: Option<ZoomAnim>,
     /// The user's location, when shown via `show_user_location`.
     user_location: Option<Coordinate>,
     /// Last CoreLocation fix with its timestamp. Reused by
@@ -153,33 +216,28 @@ impl MapInner {
 
     /// The coordinate under a screen point.
     fn screen_to_coord(&self, x: f64, y: f64) -> Coordinate {
-        let z = self.camera.zoom.round() as u8;
-        let scale = (self.camera.zoom - f64::from(z)).exp2();
-        let (cx, cy) = self.world_px(self.camera.center);
-        let origin_x = cx - self.width / 2.0;
-        let origin_y = cy - self.height / 2.0;
-        let wx = x / scale + origin_x;
-        let wy = y / scale + origin_y;
-        let n = f64::from(1u32 << z);
-        let lon = wx / TILE_SIZE / n * 360.0 - 180.0;
-        let lat = ((std::f64::consts::PI * (1.0 - 2.0 * wy / TILE_SIZE / n)).sinh())
-            .atan()
-            .to_degrees();
-        Coordinate::new(lat.clamp(-85.051_128_78, 85.051_128_78), lon)
+        screen_to_coord_at(self.camera.center, self.camera.zoom, self.width, self.height, x, y)
     }
 
-    /// Zooms around a screen anchor so the coordinate under it stays put.
-    fn zoom_around(&mut self, x: f64, y: f64, delta: f64) {
-        let anchor = self.screen_to_coord(x, y);
-        let new_zoom = (self.camera.zoom + delta).clamp(0.0, f64::from(tiles::MAX_ZOOM));
-        if (new_zoom - self.camera.zoom).abs() < f64::EPSILON {
-            return;
+    /// Zoom target around a screen anchor so the coordinate under it stays
+    /// put, computed from an explicit camera (used to retarget mid-flight).
+    fn zoom_target(
+        &self,
+        from_center: Coordinate,
+        from_zoom: f64,
+        x: f64,
+        y: f64,
+        delta: f64,
+    ) -> (Coordinate, f64) {
+        let anchor = screen_to_coord_at(from_center, from_zoom, self.width, self.height, x, y);
+        let new_zoom = (from_zoom + delta).clamp(0.0, f64::from(tiles::MAX_ZOOM));
+        if (new_zoom - from_zoom).abs() < f64::EPSILON {
+            return (from_center, from_zoom);
         }
-        self.camera.zoom = new_zoom;
 
         // Shift the center so the anchor stays under (x, y).
-        let z = self.camera.zoom.round() as u8;
-        let scale = (self.camera.zoom - f64::from(z)).exp2();
+        let z = new_zoom.round() as u8;
+        let scale = (new_zoom - f64::from(z)).exp2();
         let (fx, fy) = tiles::tile_for(anchor, z);
         let (ax, ay) = (fx * TILE_SIZE, fy * TILE_SIZE);
         let origin_x = ax - x / scale;
@@ -191,10 +249,77 @@ impl MapInner {
         let lat = ((std::f64::consts::PI * (1.0 - 2.0 * center_wy / TILE_SIZE / n)).sinh())
             .atan()
             .to_degrees();
-        self.camera.center = Coordinate::new(
-            lat.clamp(-85.051_128_78, 85.051_128_78),
-            lon.clamp(-180.0, 180.0),
-        );
+        (
+            Coordinate::new(
+                lat.clamp(-85.051_128_78, 85.051_128_78),
+                lon.clamp(-180.0, 180.0),
+            ),
+            new_zoom,
+        )
+    }
+
+    /// Camera actually on screen right now: the animation interpolation
+    /// while a zoom is running, else the stored camera.
+    fn displayed_camera(&self, now: Instant) -> (Coordinate, f64) {
+        let Some(anim) = &self.zoom_anim else {
+            return (self.camera.center, self.camera.zoom);
+        };
+        let t = anim.progress(now);
+        (
+            lerp_coord(anim.from_center, anim.to_center, ease_out_cubic(t)),
+            anim.from_zoom + (anim.to_zoom - anim.from_zoom) * ease_out_cubic(t),
+        )
+    }
+
+    /// Starts (or retargets) an animated zoom step around a screen anchor.
+    /// New wheel events mid-flight retarget from the currently displayed
+    /// state, so fast scrolling accelerates smoothly instead of jumping.
+    fn begin_zoom_step(&mut self, x: f64, y: f64, delta: f64) {
+        let now = Instant::now();
+        let (from_center, from_zoom) = self.displayed_camera(now);
+        let (to_center, to_zoom) = self.zoom_target(from_center, from_zoom, x, y, delta);
+        if (to_zoom - from_zoom).abs() < f64::EPSILON {
+            return;
+        }
+        // Snap the stored camera to the displayed state; the animation
+        // interpolates from there.
+        self.camera.center = from_center;
+        self.camera.zoom = from_zoom;
+        self.zoom_anim = Some(ZoomAnim {
+            from_center,
+            from_zoom,
+            to_center,
+            to_zoom,
+            start: now,
+        });
+    }
+
+    /// Advances a running zoom animation to `now`. Returns the camera
+    /// callback payload once the animation completes.
+    fn advance_anim(&mut self, now: Instant) -> Option<(CameraCallback, MapCamera)> {
+        let anim = self.zoom_anim.take()?;
+        let t = anim.progress(now);
+        let e = ease_out_cubic(t);
+        self.camera.center = lerp_coord(anim.from_center, anim.to_center, e);
+        self.camera.zoom = anim.from_zoom + (anim.to_zoom - anim.from_zoom) * e;
+        if t >= 1.0 {
+            self.zoom_anim = None;
+            self.on_camera_changed.clone().map(|cb| (cb, self.camera))
+        } else {
+            self.zoom_anim = Some(anim);
+            None
+        }
+    }
+
+    /// Cancels a running zoom animation, snapping to the displayed state
+    /// so pans and presses take over seamlessly.
+    fn cancel_anim(&mut self, now: Instant) {
+        if self.zoom_anim.is_some() {
+            let (center, zoom) = self.displayed_camera(now);
+            self.camera.center = center;
+            self.camera.zoom = zoom;
+            self.zoom_anim = None;
+        }
     }
 
     /// Zoom level at which the bounding box fits into the viewport.
@@ -1056,6 +1181,7 @@ impl MapView {
                 width: 400.0,
                 height: 300.0,
                 offline: false,
+                zoom_anim: None,
                 user_location: None,
                 location_cache: None,
                 on_annotation_tapped: None,
@@ -1109,15 +1235,29 @@ impl MapView {
 
     // ─── Camera ────────────────────────────────────────────
 
-    /// The current camera.
+    /// The current camera (the interpolated one while a zoom animation
+    /// is running).
     pub fn camera(&self) -> MapCamera {
-        self.shared.lock().map(|s| s.camera).unwrap_or_default()
+        self.shared
+            .lock()
+            .map(|s| {
+                let (center, zoom) = s.displayed_camera(Instant::now());
+                MapCamera {
+                    center,
+                    zoom,
+                    pitch: s.camera.pitch,
+                    heading: s.camera.heading,
+                }
+            })
+            .unwrap_or_default()
     }
 
-    /// Replaces the camera and notifies the camera callback.
+    /// Replaces the camera and notifies the camera callback. Cancels any
+    /// running zoom animation.
     pub fn set_camera(&self, camera: MapCamera) {
         if let Ok(mut s) = self.shared.lock() {
             s.camera = camera;
+            s.zoom_anim = None;
         }
         self.notify_camera_changed();
     }
@@ -1270,6 +1410,7 @@ impl MapView {
                     if let Some((coordinate, at)) = s.location_cache {
                         if at.elapsed() < LOCATION_CACHE_TTL {
                             s.user_location = Some(coordinate);
+                            s.zoom_anim = None;
                             let zoom = s.camera.zoom.max(13.0);
                             s.camera = MapCamera::new(coordinate, zoom);
                             s.on_camera_changed.clone().map(|cb| (cb, s.camera))
@@ -1300,6 +1441,7 @@ impl MapView {
                             Ok(mut s) => {
                                 s.user_location = Some(coordinate);
                                 s.location_cache = Some((coordinate, Instant::now()));
+                                s.zoom_anim = None;
                                 let zoom = s.camera.zoom.max(13.0);
                                 s.camera = MapCamera::new(coordinate, zoom);
                                 s.on_camera_changed.clone().map(|cb| (cb, s.camera))
@@ -1376,6 +1518,8 @@ impl MapView {
             s.press = Some((lx, ly));
             s.last_hover = Some((lx, ly));
             s.drag_moved = false;
+            // A press takes over from a running zoom animation.
+            s.cancel_anim(Instant::now());
         }
     }
 
@@ -1423,7 +1567,9 @@ impl MapView {
                         } else {
                             // Dragging right moves content right (viewport
                             // west); dragging down moves content down
-                            // (viewport north).
+                            // (viewport north). Cancels a running zoom
+                            // animation first (snaps to displayed state).
+                            s.cancel_anim(Instant::now());
                             s.camera.pan_pixels(dx, -dy);
                             s.drag_moved = true;
                             s.on_camera_changed.clone().map(|cb| (cb, s.camera))
@@ -1443,23 +1589,16 @@ impl MapView {
     fn wheel_at(&mut self, dx: f64, dy: f64) {
         let _ = dx;
         // TontooUI reports scroll deltas in logical px (right/down
-        // positive); one notch (~20 px) is one zoom level.
+        // positive); one notch (~20 px) is one zoom level. The step is
+        // animated (~200 ms ease-out); the camera callback fires when the
+        // animation completes.
         let delta = (-dy / 20.0).clamp(-3.0, 3.0);
         if delta == 0.0 {
             return;
         }
-        let callback = {
-            match self.shared.lock() {
-                Ok(mut s) => {
-                    let (ax, ay) = s.last_hover.unwrap_or((s.width / 2.0, s.height / 2.0));
-                    s.zoom_around(ax, ay, delta);
-                    s.on_camera_changed.clone().map(|cb| (cb, s.camera))
-                }
-                Err(_) => None,
-            }
-        };
-        if let Some((cb, camera)) = callback {
-            cb(&camera);
+        if let Ok(mut s) = self.shared.lock() {
+            let (ax, ay) = s.last_hover.unwrap_or((s.width / 2.0, s.height / 2.0));
+            s.begin_zoom_step(ax, ay, delta);
         }
     }
 }
@@ -1484,6 +1623,12 @@ impl TontooView for MapView {
         if self.placed_w <= 0.0 || self.placed_h <= 0.0 {
             return;
         }
+        // Advance a running zoom animation before requesting tiles so the
+        // new frame already fetches for the interpolated camera.
+        let completed = match self.shared.lock() {
+            Ok(mut s) => s.advance_anim(Instant::now()),
+            Err(_) => None,
+        };
         request_visible_tiles(&self.shared);
 
         let dpr = fonts.scale as f64;
@@ -1514,6 +1659,12 @@ impl TontooView for MapView {
         inner.toggle_rect = toggle_rect;
 
         scene.pop_layer();
+        drop(inner);
+
+        // Fire the camera callback once the zoom animation lands.
+        if let Some((cb, camera)) = completed {
+            cb(&camera);
+        }
     }
 
     fn mouse_down(&mut self, x: f64, y: f64) {
@@ -1620,5 +1771,71 @@ mod tests {
         // centered synchronously.
         let camera = map.camera();
         assert!((camera.center.latitude - 48.137).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ease_out_cubic_shape() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        // Fast start: halfway through time covers most of the distance.
+        assert!(ease_out_cubic(0.5) > 0.5);
+        assert!(ease_out_cubic(0.5) < 1.0);
+    }
+
+    #[test]
+    fn lerp_takes_shortest_longitude_path() {
+        // 179 to -179 crosses the antimeridian (+2 degrees), not the long
+        // way around (-358 degrees).
+        let mid = lerp_coord(Coordinate::new(0.0, 179.0), Coordinate::new(0.0, -179.0), 0.5);
+        assert!((mid.longitude.abs() - 180.0).abs() < 1e-9);
+        let end = lerp_coord(Coordinate::new(10.0, 179.0), Coordinate::new(20.0, -179.0), 1.0);
+        assert!((end.latitude - 20.0).abs() < 1e-9);
+        assert!((end.longitude + 179.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_step_animates_to_target() {
+        let map = MapView::new(&MapsConfiguration::new());
+        map.set_center(Coordinate::new(52.52, 13.405), 10.0);
+        {
+            let mut s = map.shared.lock().unwrap();
+            s.width = 800.0;
+            s.height = 600.0;
+            s.begin_zoom_step(400.0, 300.0, 1.0);
+            assert!(s.zoom_anim.is_some());
+            let target_zoom = s.zoom_anim.as_ref().unwrap().to_zoom;
+            assert!((target_zoom - 11.0).abs() < 1e-9);
+            // Mid-flight the displayed camera is between start and target.
+            let anim_start = s.zoom_anim.as_ref().unwrap().start;
+            let (mid_center, mid_zoom) = s.displayed_camera(anim_start + ZOOM_ANIM_DURATION / 2);
+            assert!(mid_zoom > 10.0 && mid_zoom < 11.0);
+            let _ = mid_center;
+            // Completing the animation lands exactly on target and fires.
+            let done = s.advance_anim(anim_start + ZOOM_ANIM_DURATION + Duration::from_millis(1));
+            assert!(s.zoom_anim.is_none());
+            assert!((s.camera.zoom - 11.0).abs() < 1e-9);
+            // No callback registered, so nothing to fire.
+            assert!(done.is_none());
+        }
+    }
+
+    #[test]
+    fn zoom_step_retargets_mid_flight() {
+        let map = MapView::new(&MapsConfiguration::new());
+        map.set_center(Coordinate::new(52.52, 13.405), 10.0);
+        {
+            let mut s = map.shared.lock().unwrap();
+            s.width = 800.0;
+            s.height = 600.0;
+            s.begin_zoom_step(400.0, 300.0, 1.0);
+            let start = s.zoom_anim.as_ref().unwrap().start;
+            // Second notch before the first lands: retargets from the
+            // displayed state toward zoom 12-ish, single animation.
+            s.begin_zoom_step(400.0, 300.0, 1.0);
+            assert!(s.zoom_anim.is_some());
+            let _ = start;
+            let target = s.zoom_anim.as_ref().unwrap().to_zoom;
+            assert!(target > 11.0 && target <= 12.0 + 1e-9);
+        }
     }
 }

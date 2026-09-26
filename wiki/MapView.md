@@ -29,9 +29,15 @@ let stack = VStack::new().child(map);
 | Input | Action |
 |---|---|
 | Drag | Pan (content follows the pointer) |
-| Scroll | Zoom around the hover anchor (one notch is one level) |
+| Scroll | Animated zoom around the hover anchor (~200 ms ease-out per notch) |
 | Tap on a pin | Fires the annotation-tapped callback |
 | Tap on layer pill (bottom left) | Switch between satellite imagery and the base style |
+
+Zoom steps animate instead of jumping: new wheel events mid-flight
+retarget from the currently displayed state, so fast scrolling
+accelerates smoothly. The camera callback fires once the animation
+lands. Pressing or dragging mid-zoom cancels the animation and takes
+over seamlessly; `set_camera` (and everything built on it) also cancels.
 
 Panning tracks the hover position between press and release and applies
 only the delta since the last motion event, so panning speed matches the
