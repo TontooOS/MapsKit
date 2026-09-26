@@ -8,8 +8,8 @@ use std::path::PathBuf;
 /// Visual style of the base map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MapStyle {
-    /// Light basemap: classic OSM cartography from the Fastly CDN (the
-    /// same tiles Leaflet shows by default).
+    /// Light basemap: Esri World Street Map, a modern Google-Maps-like
+    /// light cartography (no API key).
     Light,
     /// Dark basemap (Esri dark gray canvas on the fallback provider).
     Dark,

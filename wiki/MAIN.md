@@ -61,7 +61,7 @@ See [Providers.md](Providers.md), [MapView.md](MapView.md) and
 MapsConfiguration (style, POI filter, cache dir, user agent)
   |
   +-- ProviderChain          (ordered fallback over MapProvider)
-  |     +-- EsriProvider     (Esri World Imagery satellite tiles)
+  |     +-- EsriProvider     (World Imagery satellite + World Street Map light)
   |     +-- OsmProvider      (Nominatim + Overpass + OSRM + OSM tiles)
   |     +-- PhotonProvider   (Photon + FOSSGIS OSRM + Esri dark tiles)
   |
@@ -97,10 +97,9 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
   1-tile prefetch ring loads around the viewport.
 - 2026-09-26: Location caching: `show_user_location` reuses the last fix
   for 60 s instead of querying CoreLocation on every press.
-- 2026-09-26: Light tiles now come from `tile.openstreetmap.org` (the same
-  Fastly CDN tiles Leaflet shows: fast, no key) instead of slow Wikimedia
-  `osm-intl`; center tiles download first. The fallback provider serves
-  dark tiles only.
+- 2026-09-26: Google-Maps-like light style: `MapStyle::Light` now serves
+  the Esri World Street Map (same fast CDN as satellite, no key) with a
+  new `mapskit.map.attribution.esri_street` string.
 - 2026-09-26: Replaced CARTO basemap tiles (now require an API key, views
   showed "API KEY REQUIRED" placeholders) with keyless sources. Provider
   renamed to `Photon + OSM/Esri`; attribution is now style-based with a new

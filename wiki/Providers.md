@@ -37,16 +37,19 @@ the UI thread.
 | `nearby` | Places sorted by distance | Empty category list, provider error |
 | `route` | One route with steps | Unroutable pair, provider error |
 
-## EsriProvider (satellite tiles)
+## EsriProvider (satellite + light street tiles)
 
-Backed by the public ArcGIS World Imagery service
-(`server.arcgisonline.com`). This provider is tile-only:
+Backed by the public ArcGIS services (`server.arcgisonline.com`, no key).
+This provider is tile-only:
 
-- `supports_style` returns true only for `MapStyle::Satellite`.
+- `supports_style` returns true for `MapStyle::Satellite` (World Imagery)
+  and `MapStyle::Light` (World Street Map: light, modern Google-Maps-like
+  cartography).
 - `search`, `reverse_geocode`, `nearby` and `route` return a
   `MapsError::Provider` error, so the chain falls through to OSM and Photon
   for all services.
-- `tile_url` uses the ArcGIS row-first order: `/tile/{z}/{y}/{x}`.
+- `tile_url` uses the ArcGIS row-first order: `/tile/{z}/{y}/{x}` and
+  follows the configured style (imagery vs street map).
 
 ## OsmProvider (primary)
 
@@ -86,7 +89,7 @@ use mapskit::{Coordinate, MapStyle, ProviderChain};
 let chain = ProviderChain::default_providers();
 assert_eq!(
     chain.names(),
-    vec!["Esri World Imagery", "OpenStreetMap", "Photon + OSM/Esri"]
+    vec!["Esri", "OpenStreetMap", "Photon + OSM/Esri"]
 );
 
 // Tries every provider until one succeeds.
