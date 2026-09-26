@@ -6,9 +6,8 @@
 //!    (`MapStyle::Satellite` only).
 //! 2. [`OsmProvider`] (primary) — OpenStreetMap raster tiles, Nominatim
 //!    search/geocoding, Overpass place details and OSRM routing.
-//! 3. [`PhotonProvider`] (fallback) — Wikimedia / Esri basemap tiles,
-//!    Komoot Photon search/geocoding and the FOSSGIS OSRM instances for
-//!    routing.
+//! 3. [`PhotonProvider`] (fallback) — Esri dark canvas tiles, Komoot
+//!    Photon search/geocoding and the FOSSGIS OSRM instances for routing.
 //!
 //! A [`ProviderChain`] tries every provider in order and returns the first
 //! successful result, so apps keep working when one service is down.

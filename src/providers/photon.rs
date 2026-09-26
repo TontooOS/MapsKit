@@ -1,11 +1,12 @@
-//! Fallback provider: Komoot Photon + keyless basemaps.
+//! Fallback provider: Komoot Photon + Esri dark canvas.
 //!
 //! - Search / geocoding: Photon (`photon.komoot.io`)
 //! - Nearby places: Photon category keyword search around a center
 //! - Routing: FOSSGIS OSRM instances (`routing.openstreetmap.de`)
-//! - Tiles: Wikimedia `osm-intl` (light) and Esri `World_Dark_Gray_Base`
-//!   (dark). Both are free without API keys. (CARTO basemaps previously
-//!   used here now require an API key and are no longer used.)
+//! - Tiles: Esri `World_Dark_Gray_Base` (dark style only, no API key).
+//!   Light and standard tiles come from the primary OSM provider (the same
+//!   Fastly CDN tiles Leaflet uses). (CARTO basemaps previously used here
+//!   now require an API key and are no longer used.)
 
 use super::osm::fetch_osrm_route;
 use super::{get_with_query, http_client, response_json, MapProvider};
@@ -160,9 +161,11 @@ impl MapProvider for PhotonProvider {
         "Photon + OSM/Esri"
     }
 
-    /// Serves the light (Wikimedia) and dark (Esri canvas) basemaps.
+    /// Serves the dark Esri canvas basemap. Light and standard tiles come
+    /// from the primary OSM provider (same CDN tiles Leaflet uses); search,
+    /// geocoding and routing still fall back to Photon for every style.
     fn supports_style(&self, style: MapStyle) -> bool {
-        matches!(style, MapStyle::Light | MapStyle::Dark)
+        matches!(style, MapStyle::Dark)
     }
 
     fn is_available(&self) -> bool {
@@ -326,16 +329,14 @@ impl MapProvider for PhotonProvider {
         )
     }
 
-    /// Keyless basemap tiles for the configured style: Wikimedia
-    /// `osm-intl` for light, Esri dark gray canvas for dark (ArcGIS serves
-    /// row-first: `/tile/{z}/{y}/{x}`).
+    /// Keyless basemap tiles: Esri dark gray canvas (ArcGIS serves
+    /// row-first: `/tile/{z}/{y}/{x}`). The configured style is kept for
+    /// service behavior; tile imagery is always the dark canvas.
     fn tile_url(&self, x: u32, y: u32, z: u8) -> String {
-        match self.style {
-            MapStyle::Dark => format!(
-                "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
-            ),
-            _ => format!("https://maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png"),
-        }
+        let _ = self.style;
+        format!(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+        )
     }
 }
 
@@ -357,13 +358,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tile_urls_follow_style() {
-        let light = PhotonProvider::with_config(&MapsConfiguration::new().style(MapStyle::Light));
-        assert_eq!(
-            light.tile_url(5, 6, 7),
-            "https://maps.wikimedia.org/osm-intl/7/5/6.png"
-        );
-
+    fn tile_urls_dark_canvas() {
         let dark = PhotonProvider::with_config(&MapsConfiguration::new().style(MapStyle::Dark));
         assert_eq!(
             dark.tile_url(5, 6, 7),
@@ -374,7 +369,7 @@ mod tests {
     #[test]
     fn style_support() {
         let p = PhotonProvider::new();
-        assert!(p.supports_style(MapStyle::Light));
+        assert!(!p.supports_style(MapStyle::Light));
         assert!(p.supports_style(MapStyle::Dark));
         assert!(!p.supports_style(MapStyle::Standard));
     }

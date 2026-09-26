@@ -120,7 +120,7 @@ impl MapInner {
     fn attribution_key(&self) -> &'static str {
         // Attribution follows the active imagery, not the provider name:
         // satellite and dark canvas are Esri services, everything else is
-        // OpenStreetMap data (OSM standard tiles, Wikimedia osm-intl).
+        // OpenStreetMap data.
         match self.style {
             MapStyle::Satellite => "mapskit.map.attribution.esri",
             MapStyle::Dark => "mapskit.map.attribution.esri_dark",
@@ -403,6 +403,17 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
                 });
             }
         }
+
+        // Center tiles first: the middle of the viewport fills in before
+        // the edges, which reads as much faster loading.
+        let (cfx, cfy) = tiles::tile_for(s.camera.center, zoom);
+        jobs.sort_by(|a, b| {
+            let da = (f64::from(a.key.x) + 0.5 - cfx).powi(2)
+                + (f64::from(a.key.y) + 0.5 - cfy).powi(2);
+            let db = (f64::from(b.key.x) + 0.5 - cfx).powi(2)
+                + (f64::from(b.key.y) + 0.5 - cfy).powi(2);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Offline badge: on while any currently visible tile failed.
         s.offline = (min_y..=max_y).any(|ty| {

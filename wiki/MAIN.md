@@ -5,7 +5,7 @@ design philosophy: an interactive `MapView`, a `MapCamera` viewport object,
 annotations and overlays, place search with details, forward/reverse
 geocoding, turn-by-turn routing, an optional 3D `GlobeView` and a C FFI.
 Three providers are built in with automatic fallback (Esri satellite tiles,
-OpenStreetMap primary, Photon + Wikimedia/Esri fallback), so no API keys are required.
+OpenStreetMap primary, Photon + Esri fallback), so no API keys are required.
 
 - Repository: tontoo-os/TontooLibs/MapsKit
 - License: TCL
@@ -63,7 +63,7 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
   +-- ProviderChain          (ordered fallback over MapProvider)
   |     +-- EsriProvider     (Esri World Imagery satellite tiles)
   |     +-- OsmProvider      (Nominatim + Overpass + OSRM + OSM tiles)
-  |     +-- PhotonProvider   (Photon + FOSSGIS OSRM + Wikimedia/Esri tiles)
+  |     +-- PhotonProvider   (Photon + FOSSGIS OSRM + Esri dark tiles)
   |
   +-- MapView                (TontooUI View, Vello tiles, pan/zoom,
   |                           satellite layer pill bottom left)
@@ -92,10 +92,13 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Changelog
 
+- 2026-09-26: Light tiles now come from `tile.openstreetmap.org` (the same
+  Fastly CDN tiles Leaflet shows: fast, no key) instead of slow Wikimedia
+  `osm-intl`; center tiles download first. The fallback provider serves
+  dark tiles only.
 - 2026-09-26: Replaced CARTO basemap tiles (now require an API key, views
-  showed "API KEY REQUIRED" placeholders) with keyless sources: Wikimedia
-  `osm-intl` for light, Esri dark gray canvas for dark. Provider renamed to
-  `Photon + OSM/Esri`; attribution is now style-based with a new
+  showed "API KEY REQUIRED" placeholders) with keyless sources. Provider
+  renamed to `Photon + OSM/Esri`; attribution is now style-based with a new
   `mapskit.map.attribution.esri_dark` string. Also fixed the layer toggle
   pill contrast (was dark text on a dark pill in light mode).
 

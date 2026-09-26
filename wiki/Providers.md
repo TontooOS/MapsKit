@@ -69,12 +69,11 @@ come from a Nominatim `lookup` with `extratags=1`; ids use the format
 |---|---|
 | Search / reverse geocoding / nearby | Komoot Photon (`photon.komoot.io`) |
 | Routing | FOSSGIS OSRM (`routing.openstreetmap.de`) |
-| Tiles (light) | Wikimedia `osm-intl` (`maps.wikimedia.org`, no key) |
 | Tiles (dark) | Esri dark gray canvas (`server.arcgisonline.com`, no key) |
 
-`supports_style` returns true for `MapStyle::Light` and `MapStyle::Dark`.
-(CARTO basemaps were used here before but now require an API key, so they
-are no longer used.) Nearby search queries Photon per category keyword
+`supports_style` returns true for `MapStyle::Dark` only; light and
+standard tiles come from the primary OSM provider. (CARTO basemaps were
+used here before but now require an API key, so they are no longer used.) Nearby search queries Photon per category keyword
 biased to the center and filters results to the requested radius. Ids reuse
 the OSM element id (`osm:N123`) when Photon provides one, else
 `photon:<lat>,<lon>`.
