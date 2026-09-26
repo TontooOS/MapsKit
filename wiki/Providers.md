@@ -1,6 +1,6 @@
 # Providers
 
-MapsKit ships four map providers with automatic fallback. Every provider
+MapsKit ships three map providers with automatic fallback. Every provider
 implements the `MapProvider` trait; a `ProviderChain` tries them in order and
 returns the first successful result, so apps keep working when one service is
 down. No API keys are required.
@@ -36,29 +36,6 @@ the UI thread.
 | `place_details` | Enriched place | Unknown id returns the place unchanged |
 | `nearby` | Places sorted by distance | Empty category list, provider error |
 | `route` | One route with steps | Unroutable pair, provider error |
-
-## BackendProvider (primary)
-
-All TontooOS map clients use the TontooOS backend maps API, which proxies
-and caches upstream services (tiles, Nominatim, Overpass, OSRM, Wikidata).
-Base URL resolution: explicit `MapsConfiguration::backend_url`, then the
-`TONTOO_BACKEND_URL` environment variable, then localhost
-(`http://127.0.0.1/tontooos/api/maps`; on devices the system points the
-variable at the LAN backend).
-
-| Capability | Backend endpoint |
-|---|---|
-| Tiles (all styles) | `/tiles/{street,satellite,dark}/...` |
-| Search | `/search` (sorted nearest-first around `near`) |
-| Reverse geocoding | `/reverse` |
-| Place details | `/places/details` (Overpass + Wikidata enrichment) |
-| Nearby places | `/places/nearby` (distance-sorted) |
-| Routing | `/route` (driving only; other modes fall through the chain) |
-
-`supports_style` returns true for every style. Search results carry
-`tontoo:<place_id>` ids; nearby/details use `osm:{N|W|R}{id}` ids shared
-with the OSM provider. When the backend is unreachable every call fails
-and the chain falls through to the direct providers below.
 
 ## EsriProvider (satellite tiles)
 
@@ -109,7 +86,7 @@ use mapskit::{Coordinate, MapStyle, ProviderChain};
 let chain = ProviderChain::default_providers();
 assert_eq!(
     chain.names(),
-    vec!["TontooOS Backend", "Esri World Imagery", "OpenStreetMap", "Photon + OSM/Esri"]
+    vec!["Esri World Imagery", "OpenStreetMap", "Photon + OSM/Esri"]
 );
 
 // Tries every provider until one succeeds.

@@ -45,15 +45,7 @@ pub struct MapsConfiguration {
     pub timeout_seconds: u64,
     /// Whether the 3D globe may fetch an earth texture from the providers.
     pub globe_earth_texture: bool,
-    /// Base URL of the TontooOS backend maps API
-    /// (`.../tontooos/api/maps`), used by the backend provider for tiles
-    /// and services. When `None`, [`MapsConfiguration::resolved_backend_url`]
-    /// falls back to `TONTOO_BACKEND_URL` and then to localhost.
-    pub backend_url: Option<String>,
 }
-
-/// Default backend maps API URL (local development server).
-pub const DEFAULT_BACKEND_URL: &str = "http://127.0.0.1/tontooos/api/maps";
 
 impl Default for MapsConfiguration {
     fn default() -> Self {
@@ -66,7 +58,6 @@ impl Default for MapsConfiguration {
             user_agent: format!("TontooOS-MapsKit/{}", crate::MAPSKIT_VERSION_STR),
             timeout_seconds: 10,
             globe_earth_texture: true,
-            backend_url: None,
         }
     }
 }
@@ -104,26 +95,6 @@ impl MapsConfiguration {
     pub fn user_agent(mut self, agent: impl Into<String>) -> Self {
         self.user_agent = agent.into();
         self
-    }
-
-    /// Overrides the TontooOS backend maps API base URL.
-    pub fn backend_url(mut self, url: impl Into<String>) -> Self {
-        self.backend_url = Some(url.into());
-        self
-    }
-
-    /// Resolved backend maps API base URL: explicit config first, then
-    /// the `TONTOO_BACKEND_URL` environment variable, then localhost.
-    /// On TontooOS devices the system sets the variable to the LAN
-    /// backend (e.g. `http://192.168.1.100/tontooos/api/maps`).
-    pub fn resolved_backend_url(&self) -> String {
-        if let Some(url) = &self.backend_url {
-            return url.clone();
-        }
-        std::env::var("TONTOO_BACKEND_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_BACKEND_URL.to_string())
     }
 
     /// Resolved cache directory, creating it when missing.

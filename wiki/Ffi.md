@@ -67,7 +67,7 @@ tontoo_mapskit_view_free(view);
 The handle drives the model of a Rust `MapView` (which renders inside
 TontooUI). Config keys: `style` (`light`, `dark`, `standard`,
 `satellite`), `shows_points_of_interest`, `cache_directory`,
-`user_agent`, `backend_url`, `globe_earth_texture`. Passing `NULL` uses defaults.
+`user_agent`, `globe_earth_texture`. Passing `NULL` uses defaults.
 
 ## Globe Model
 

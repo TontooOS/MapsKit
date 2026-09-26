@@ -90,8 +90,7 @@ typedef struct _TontooMapView TontooMapView;
  * { "style": "light" | "dark" | "standard" | "satellite",
  *   "shows_points_of_interest": true,
  *   "cache_directory": "/path",
- *   "user_agent": "MyApp/1.0",
- *   "backend_url": "http://192.168.1.100/tontooos/api/maps" }
+ *   "user_agent": "MyApp/1.0" }
  * May be NULL for defaults.
  */
 TontooMapView *tontoo_mapskit_view_new(const char *config_json);

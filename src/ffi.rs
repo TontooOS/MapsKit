@@ -74,9 +74,6 @@ fn config_from_json(json: &str) -> MapsConfiguration {
     if let Some(agent) = value["user_agent"].as_str() {
         config.user_agent = agent.to_string();
     }
-    if let Some(url) = value["backend_url"].as_str() {
-        config.backend_url = Some(url.to_string());
-    }
     if let Some(texture) = value["globe_earth_texture"].as_bool() {
         config.globe_earth_texture = texture;
     }
