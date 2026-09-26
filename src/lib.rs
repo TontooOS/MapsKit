@@ -9,8 +9,8 @@
 //! working when one service is down. No API keys are required:
 //!
 //! | Priority | Provider | Tiles | Search / Geocoding | Places | Routing |
-//! |---|---|---|---|---|---|
-//! | Light + Satellite | Esri | ArcGIS (street map / imagery) | - | - | - |
+//! |---|---|---|---|---|
+//! | Satellite | Esri World Imagery | ArcGIS imagery | - | - | - |
 //! | Primary | OpenStreetMap | tile.openstreetmap.org | Nominatim | Overpass API | OSRM |
 //! | Fallback | Photon + OSM/Esri | Esri dark canvas | Photon | Photon | FOSSGIS OSRM |
 //!

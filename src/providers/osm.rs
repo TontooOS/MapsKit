@@ -58,9 +58,10 @@ impl MapProvider for OsmProvider {
         "OpenStreetMap"
     }
 
-    /// Serves the classic standard cartography.
+    /// Serves the classic standard cartography for the standard and light
+    /// styles (the same Leaflet-default Fastly CDN tiles).
     fn supports_style(&self, style: MapStyle) -> bool {
-        matches!(style, MapStyle::Standard)
+        matches!(style, MapStyle::Standard | MapStyle::Light)
     }
 
     fn is_available(&self) -> bool {
@@ -601,7 +602,7 @@ mod tests {
     fn style_support() {
         let p = OsmProvider::new();
         assert!(p.supports_style(MapStyle::Standard));
-        assert!(!p.supports_style(MapStyle::Light));
+        assert!(p.supports_style(MapStyle::Light));
         assert!(!p.supports_style(MapStyle::Dark));
     }
 

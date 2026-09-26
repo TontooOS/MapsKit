@@ -74,7 +74,7 @@ Providers declare the styles they can serve via
 | Style | Serving provider |
 |---|---|
 | `MapStyle::Standard` | OpenStreetMap standard cartography |
-| `MapStyle::Light` | Esri World Street Map (light, Google-Maps-like) |
+| `MapStyle::Light` | OpenStreetMap cartography (same Fastly CDN tiles Leaflet uses) |
 | `MapStyle::Dark` | Esri dark gray canvas |
 | `MapStyle::Satellite` | Esri World Imagery |
 

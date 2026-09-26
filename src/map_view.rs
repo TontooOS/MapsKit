@@ -192,11 +192,10 @@ impl MapInner {
 
     fn attribution_key(&self) -> &'static str {
         // Attribution follows the active imagery, not the provider name:
-        // both Esri services attribute Esri, everything else is
+        // satellite and dark canvas are Esri services, everything else is
         // OpenStreetMap data.
         match self.style {
             MapStyle::Satellite => "mapskit.map.attribution.esri",
-            MapStyle::Light => "mapskit.map.attribution.esri_street",
             MapStyle::Dark => "mapskit.map.attribution.esri_dark",
             _ => "mapskit.map.attribution.osm",
         }

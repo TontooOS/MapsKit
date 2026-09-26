@@ -28,7 +28,6 @@
     "mapskit.map.attribution.carto": "\u00a9 CARTO \u00a9 OpenStreetMap contributors",
     "mapskit.map.attribution.esri": "\u00a9 Esri \u00a9 Maxar \u00a9 Earthstar Geographics",
     "mapskit.map.attribution.esri_dark": "\u00a9 Esri \u00a9 OpenStreetMap contributors",
-    "mapskit.map.attribution.esri_street": "\u00a9 Esri, HERE, Garmin, \u00a9 OpenStreetMap contributors",
     "mapskit.error.network": "A network error occurred.",
     "mapskit.error.parse": "The server response could not be read.",
     "mapskit.error.provider": "The map provider reported an error."

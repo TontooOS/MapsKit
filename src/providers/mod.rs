@@ -2,8 +2,8 @@
 //!
 //! MapsKit ships three providers:
 //!
-//! 1. [`EsriProvider`] — Esri raster tiles (`MapStyle::Satellite` imagery,
-//!    `MapStyle::Light` street map).
+//! 1. [`EsriProvider`] — Esri World Imagery satellite raster tiles
+//!    (`MapStyle::Satellite` only).
 //! 2. [`OsmProvider`] (primary) — OpenStreetMap raster tiles, Nominatim
 //!    search/geocoding, Overpass place details and OSRM routing.
 //! 3. [`PhotonProvider`] (fallback) — Esri dark canvas tiles, Komoot
