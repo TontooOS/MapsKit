@@ -8,8 +8,8 @@
 //!
 //! Controls: click the map and drag to pan, scroll to zoom, click the
 //! Satellite/Standard pill to switch layers. Type a query and press Enter
-//! to search, then press Route for driving directions from your location
-//! to the nearest result.
+//! to search from your location (nearest first), then press Route for
+//! driving directions from your location to the nearest result.
 
 use mapskit::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,37 @@ use vello::peniko::Color;
 
 /// Latest search results, shared with the button callbacks.
 type SharedResults = Arc<Mutex<Vec<Place>>>;
+
+/// Origin for search and routing: the known user dot, else a fresh
+/// CoreLocation fix (which also sets the dot and refreshes the map cache),
+/// else the map center. Returns the coordinate and whether it fell back to
+/// the map center.
+fn locate_origin(map: &MapView) -> (Coordinate, bool) {
+    let mut from_center = false;
+    let origin = map
+        .user_location()
+        .or_else(|| {
+            corelocation::get_location().ok().map(|loc| {
+                let c = Coordinate::new(loc.coordinates.latitude, loc.coordinates.longitude);
+                map.set_user_location(c);
+                c
+            })
+        })
+        .unwrap_or_else(|| {
+            from_center = true;
+            map.camera().center
+        });
+    (origin, from_center)
+}
+
+/// Sorts places by distance to `origin` (nearest first).
+fn sort_by_distance(places: &mut Vec<Place>, origin: Coordinate) {
+    places.sort_by(|a, b| {
+        let da = a.coordinate.distance_to(&origin);
+        let db = b.coordinate.distance_to(&origin);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
 
 struct MapsDemo {
     bar: Titlebar,
@@ -72,24 +103,9 @@ impl MapsDemo {
                         println!("[maps_demo] search for a place first (type + Enter)");
                         return;
                     }
-                    // Origin: known user dot, else a fresh CoreLocation fix
-                    // (cached by the map), else the map center.
-                    let mut from_center = false;
-                    let origin = map.user_location().or_else(|| {
-                        corelocation::get_location()
-                            .ok()
-                            .map(|loc| {
-                                let c = Coordinate::new(
-                                    loc.coordinates.latitude,
-                                    loc.coordinates.longitude,
-                                );
-                                map.set_user_location(c);
-                                c
-                            })
-                    }).unwrap_or_else(|| {
-                        from_center = true;
-                        map.camera().center
-                    });
+                    // Origin: user location first, so "Aldi" means the Aldi
+                    // near you, not near the map center.
+                    let (origin, from_center) = locate_origin(&map);
                     let Some(dest) = places.iter().min_by(|a, b| {
                         let da = a.coordinate.distance_to(&origin);
                         let db = b.coordinate.distance_to(&origin);
@@ -147,12 +163,17 @@ impl MapsDemo {
         if query.trim().is_empty() {
             return;
         }
-        let center = self.map.camera().center;
         let map = self.map.clone();
         let results = self.results.clone();
         std::thread::spawn(move || {
-            match ProviderChain::default_providers().search(&query, Some(center), 10) {
-                Ok(places) => {
+            // Search from the user location: "Aldi" finds the Aldi stores
+            // around you, sorted nearest first.
+            let (origin, from_center) = locate_origin(&map);
+            if from_center {
+                println!("[maps_demo] no location available, searching from map center");
+            }
+            match ProviderChain::default_providers().search(&query, Some(origin), 10) {
+                Ok(mut places) => {
                     if places.is_empty() {
                         println!(
                             "{}",
@@ -163,8 +184,12 @@ impl MapsDemo {
                         );
                         return;
                     }
+                    sort_by_distance(&mut places, origin);
                     for place in &places {
-                        println!("  {} - {}", place.name, place.address.one_line());
+                        let dist = mapskit::format_distance(
+                            place.coordinate.distance_to(&origin),
+                        );
+                        println!("  {} - {} ({})", place.name, place.address.one_line(), dist);
                     }
                     // Remember the results so Route can pick the nearest one.
                     if let Ok(mut slot) = results.lock() {
