@@ -179,6 +179,10 @@ impl MapsDemo {
             if from_center {
                 println!("[maps_demo] no location available, searching from map center");
             }
+            println!(
+                "[maps_demo] searching near {:.4},{:.4}",
+                origin.latitude, origin.longitude
+            );
             match ProviderChain::default_providers().search(&query, Some(origin), 10) {
                 Ok(mut places) => {
                     if places.is_empty() {

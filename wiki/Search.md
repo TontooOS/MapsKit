@@ -21,8 +21,11 @@ for place in &places {
 ```
 
 - Whitespace-only queries return `MapsError::InvalidQuery`.
-- The optional reference coordinate biases ranking (Nominatim viewbox,
-  Photon lat/lon bias).
+- The optional reference coordinate searches around you: Nominatim first
+  tries a strictly bounded box (±1°) so "Aldi" finds the stores nearby
+  instead of somewhere global, and only falls back to a biased unbounded
+  query when that is empty (Photon uses its lat/lon bias). Results carry
+  `distance_m` from the reference when one is given.
 - `limit` is clamped to 1..=50.
 
 ## The Place Type

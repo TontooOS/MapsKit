@@ -45,43 +45,15 @@ impl OsmProvider {
     fn client(&self) -> networkkit::http::HttpClient {
         http_client(&self.user_agent, self.timeout_seconds)
     }
-}
 
-impl Default for OsmProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MapProvider for OsmProvider {
-    fn name(&self) -> &'static str {
-        "OpenStreetMap"
-    }
-
-    /// Serves the classic standard cartography for the standard and light
-    /// styles (the same Leaflet-default Fastly CDN tiles).
-    fn supports_style(&self, style: MapStyle) -> bool {
-        matches!(style, MapStyle::Standard | MapStyle::Light)
-    }
-
-    fn is_available(&self) -> bool {
-        networkkit::http::HttpRequest::new(
-            networkkit::http::HttpMethod::Head,
-            &format!("{}/status", self.nominatim_url),
-        )
-        .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-        .send()
-        .map(|r| r.is_success())
-        .unwrap_or(false)
-    }
-
-    fn search(
-        &self,
+    /// Query parameters for one Nominatim `/search` round. `bias` is the
+    /// reference coordinate, the viewbox half-size in degrees and whether
+    /// the box is strict (`bounded=1`) or a ranking preference.
+    fn search_params(
         query: &str,
-        near: Option<Coordinate>,
         limit: usize,
-    ) -> Result<Vec<Place>, MapsError> {
-        let client = self.client();
+        bias: Option<(Coordinate, f64, bool)>,
+    ) -> Vec<(&'static str, String)> {
         let mut params = vec![
             ("q", query.to_string()),
             ("format", "jsonv2".to_string()),
@@ -89,9 +61,8 @@ impl MapProvider for OsmProvider {
             ("limit", limit.clamp(1, 50).to_string()),
         ];
 
-        // Bias results towards the reference area without hard-bounding.
-        if let Some(center) = near {
-            let d = 2.0;
+        // Bias results towards the reference area.
+        if let Some((center, d, bounded)) = bias {
             params.push((
                 "viewbox",
                 format!(
@@ -102,7 +73,24 @@ impl MapProvider for OsmProvider {
                     center.latitude - d
                 ),
             ));
+            if bounded {
+                params.push(("bounded", "1".to_string()));
+            }
         }
+        params
+    }
+
+    /// One Nominatim `/search` round. `bias` is the reference coordinate,
+    /// the viewbox half-size in degrees and whether the box is strict
+    /// (`bounded=1`) or a ranking preference.
+    fn search_nominatim(
+        &self,
+        query: &str,
+        limit: usize,
+        bias: Option<(Coordinate, f64, bool)>,
+    ) -> Result<Vec<Place>, MapsError> {
+        let client = self.client();
+        let params = Self::search_params(query, limit, bias);
 
         let resp = get_with_query(&client, &format!("{}/search", self.nominatim_url), &params)?;
         if !resp.is_success() {
@@ -144,15 +132,69 @@ impl MapProvider for OsmProvider {
                 let osm_id = item["osm_id"].as_i64().unwrap_or(0);
                 let id = format!("nominatim:{osm_type}{osm_id}");
 
-                places.push(
-                    Place::new(name, coordinate)
-                        .with_id(id)
-                        .with_category(category)
-                        .with_address(address),
-                );
+                let mut place = Place::new(name, coordinate)
+                    .with_id(id)
+                    .with_category(category)
+                    .with_address(address);
+                if let Some((center, _, _)) = bias {
+                    place = place.with_distance(coordinate.distance_to(&center));
+                }
+                places.push(place);
             }
         }
         Ok(places)
+    }
+}
+
+impl Default for OsmProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MapProvider for OsmProvider {
+    fn name(&self) -> &'static str {
+        "OpenStreetMap"
+    }
+
+    /// Serves the classic standard cartography for the standard and light
+    /// styles (the same Leaflet-default Fastly CDN tiles).
+    fn supports_style(&self, style: MapStyle) -> bool {
+        matches!(style, MapStyle::Standard | MapStyle::Light)
+    }
+
+    fn is_available(&self) -> bool {
+        networkkit::http::HttpRequest::new(
+            networkkit::http::HttpMethod::Head,
+            &format!("{}/status", self.nominatim_url),
+        )
+        .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+        .send()
+        .map(|r| r.is_success())
+        .unwrap_or(false)
+    }
+
+    fn search(
+        &self,
+        query: &str,
+        near: Option<Coordinate>,
+        limit: usize,
+    ) -> Result<Vec<Place>, MapsError> {
+        // Two phases around the reference point: first strictly bounded so
+        // a POI query like "Aldi" finds the stores around you instead of
+        // somewhere global; only when that is empty fall back to a biased
+        // but unbounded query (so addresses far away still resolve).
+        if let Some(center) = near {
+            let local = self.search_nominatim(query, limit, Some((center, 1.0, true)))?;
+            if !local.is_empty() {
+                return Ok(local);
+            }
+        }
+        self.search_nominatim(
+            query,
+            limit,
+            near.map(|center| (center, 2.0, false)),
+        )
     }
 
     fn reverse_geocode(&self, coordinate: Coordinate) -> Result<Address, MapsError> {
@@ -635,5 +677,19 @@ mod tests {
     fn classify() {
         let item = serde_json::json!({ "class": "amenity", "type": "restaurant" });
         assert_eq!(classify_nominatim(&item), PlaceCategory::Restaurant);
+    }
+
+    #[test]
+    fn search_params_boundedness() {
+        let center = Coordinate::new(52.52, 13.405);
+        let strict = OsmProvider::search_params("Aldi", 10, Some((center, 1.0, true)));
+        assert!(strict.iter().any(|(k, v)| *k == "bounded" && v == "1"));
+        assert!(strict.iter().any(|(k, _)| *k == "viewbox"));
+
+        let biased = OsmProvider::search_params("Aldi", 10, Some((center, 2.0, false)));
+        assert!(biased.iter().all(|(k, _)| *k != "bounded"));
+
+        let global = OsmProvider::search_params("Aldi", 10, None);
+        assert!(global.iter().all(|(k, _)| *k != "viewbox"));
     }
 }

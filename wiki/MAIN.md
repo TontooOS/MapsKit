@@ -94,6 +94,8 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 - 2026-09-26: Backend provider removed again; maps work per device/client
   through the direct providers (backend API stays available server-side).
+- 2026-09-26: Local-first search: Nominatim tries a strictly bounded box
+  around the reference first, so POI queries find nearby results.
 - 2026-09-26: Newest-first tile queue with relevance check: moving the
   map cancels stale loads before they cost bandwidth.
 - 2026-09-26: Animated zoom: wheel notches ease out over ~200 ms and
