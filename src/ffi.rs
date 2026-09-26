@@ -2,17 +2,17 @@
 //! `Headers/mapskit.h`.
 //!
 //! The FFI layer lets C / C++ apps (and other languages that can load a
-//! shared library) embed TontooMapsKit map and globe views and call the
-//! place/routing services. Configuration is passed as a JSON string;
-//! results are returned as JSON strings owned by the caller until
-//! `tontoo_mapskit_string_free` is called.
+//! shared library) drive the TontooMapsKit place/routing services and the
+//! map/globe models. Views render inside TontooUI from Rust, so no widget
+//! pointers are handed out: view handles are opaque model objects (camera, annotations, markers) that the host embeds
+//! through its own TontooUI shell.
+//!
+//! Configuration is passed as a JSON string; results are returned as JSON
+//! strings owned by the caller until `tontoo_mapskit_string_free` is called.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int};
 use std::sync::OnceLock;
-
-use glib::translate::ToGlibPtr;
-use gtk::prelude::*;
 
 use crate::camera::MapCamera;
 use crate::config::{MapStyle, MapsConfiguration};
@@ -21,37 +21,6 @@ use crate::map_view::MapView;
 use crate::overlays::Annotation;
 use crate::providers::ProviderChain;
 use crate::types::{Coordinate, Place, Route, TravelMode};
-
-// ═══════════════════════════════════════════════════════════════
-// GL loader shared with GlobeView
-// ═══════════════════════════════════════════════════════════════
-
-/// Returns the GLX procedure address lookup used to bootstrap OpenGL.
-pub(crate) fn get_gl_proc_address(
-) -> Option<unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_void> {
-    static GET_PROC: OnceLock<
-        unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_void,
-    > = OnceLock::new();
-    Some(*GET_PROC.get_or_init(|| {
-        let lib = unsafe {
-            libloading::Library::new("libGLX.so.0")
-                .or_else(|_| libloading::Library::new("libGLX.so"))
-                .or_else(|_| libloading::Library::new("libGL.so.1"))
-                .or_else(|_| libloading::Library::new("libGL.so"))
-                .expect("Failed to load libGLX/libGL")
-        };
-        let func: libloading::Symbol<
-            unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_void,
-        > = unsafe {
-            lib.get(b"glXGetProcAddress\0")
-                .or_else(|_| lib.get(b"glXGetProcAddressARB\0"))
-                .expect("glXGetProcAddress symbol not found")
-        };
-        let ptr = *func;
-        std::mem::forget(lib);
-        ptr
-    }))
-}
 
 // ═══════════════════════════════════════════════════════════════
 // Helpers
@@ -249,17 +218,21 @@ pub unsafe extern "C" fn tontoo_mapskit_route(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Map view
+// Map model
 // ═══════════════════════════════════════════════════════════════
 
-/// Opaque map view handle handed to the C caller.
+/// Opaque map model handle handed to the C caller.
+///
+/// The model holds the camera, annotations and overlays of a `MapView`.
+/// Rendering happens inside TontooUI from Rust; this handle only drives the
+/// model.
 pub struct TontooMapView {
     view: MapView,
 }
 
-/// Create a 2D map view from a JSON configuration string.
+/// Create a 2D map model from a JSON configuration string.
 ///
-/// Config keys: `style` (`light`/`dark`/`standard`),
+/// Config keys: `style` (`light`/`dark`/`standard`/`satellite`),
 /// `shows_points_of_interest`, `cache_directory`, `user_agent`.
 ///
 /// # Safety
@@ -268,38 +241,13 @@ pub struct TontooMapView {
 #[no_mangle]
 pub unsafe extern "C" fn tontoo_mapskit_view_new(
     config_json: *const c_char,
-    error_out: *mut *mut c_char,
 ) -> *mut TontooMapView {
     let config = read_str(config_json)
         .map(|json| config_from_json(&json))
         .unwrap_or_default();
-    if let Err(e) = gtk_init_guard() {
-        set_error(error_out, &e);
-        return std::ptr::null_mut();
-    }
     Box::into_raw(Box::new(TontooMapView {
         view: MapView::new(&config),
     }))
-}
-
-/// One-time GTK initialization for library consumers that have no toolkit of
-/// their own. Safe to call repeatedly.
-fn gtk_init_guard() -> Result<(), String> {
-    if gtk::is_initialized() {
-        Ok(())
-    } else {
-        gtk::init().map_err(|e| format!("gtk init failed: {e}"))
-    }
-}
-
-/// The underlying GTK4 widget. Borrowed; do not free.
-///
-/// # Safety
-///
-/// `view` must be a handle returned by `tontoo_mapskit_view_new`.
-#[no_mangle]
-pub unsafe extern "C" fn tontoo_mapskit_view_widget(view: *mut TontooMapView) -> *mut gtk::ffi::GtkWidget {
-    (*view).view.widget().clone().upcast::<gtk::Widget>().to_glib_none().0
 }
 
 /// Set the camera center and zoom level.
@@ -385,6 +333,8 @@ pub unsafe extern "C" fn tontoo_mapskit_view_display_route(
 
 /// Show the blue user location dot using CoreLocation.
 ///
+/// Resolves on a worker thread and centers the model when it answers.
+///
 /// # Safety
 ///
 /// `view` must be valid.
@@ -393,7 +343,7 @@ pub unsafe extern "C" fn tontoo_mapskit_view_show_user_location(view: *mut Tonto
     (*view).view.show_user_location();
 }
 
-/// Destroy a map view handle.
+/// Destroy a map model handle.
 ///
 /// # Safety
 ///
@@ -406,15 +356,18 @@ pub unsafe extern "C" fn tontoo_mapskit_view_free(view: *mut TontooMapView) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Globe view
+// Globe model
 // ═══════════════════════════════════════════════════════════════
 
-/// Opaque globe view handle handed to the C caller.
+/// Opaque globe model handle handed to the C caller.
+///
+/// Rendering happens inside TontooUI from Rust; this handle only drives the
+/// model (center, markers, rotation).
 pub struct TontooGlobe {
     globe: GlobeView,
 }
 
-/// Create a 3D globe view from a JSON configuration string.
+/// Create a globe model from a JSON configuration string.
 ///
 /// # Safety
 ///
@@ -422,28 +375,13 @@ pub struct TontooGlobe {
 #[no_mangle]
 pub unsafe extern "C" fn tontoo_mapskit_globe_new(
     config_json: *const c_char,
-    error_out: *mut *mut c_char,
 ) -> *mut TontooGlobe {
     let config = read_str(config_json)
         .map(|json| config_from_json(&json))
         .unwrap_or_default();
-    if let Err(e) = gtk_init_guard() {
-        set_error(error_out, &e);
-        return std::ptr::null_mut();
-    }
     Box::into_raw(Box::new(TontooGlobe {
         globe: GlobeView::new(&config),
     }))
-}
-
-/// The underlying GTK4 widget. Borrowed; do not free.
-///
-/// # Safety
-///
-/// `globe` must be a handle returned by `tontoo_mapskit_globe_new`.
-#[no_mangle]
-pub unsafe extern "C" fn tontoo_mapskit_globe_widget(globe: *mut TontooGlobe) -> *mut gtk::ffi::GtkWidget {
-    (*globe).globe.widget().clone().upcast::<gtk::Widget>().to_glib_none().0
 }
 
 /// Center the globe on a coordinate.
@@ -491,7 +429,7 @@ pub unsafe extern "C" fn tontoo_mapskit_globe_set_auto_rotate(
     (*globe).globe.set_auto_rotate(enabled != 0);
 }
 
-/// Destroy a globe view handle.
+/// Destroy a globe model handle.
 ///
 /// # Safety
 ///

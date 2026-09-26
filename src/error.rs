@@ -17,7 +17,7 @@ pub enum MapsError {
     InvalidQuery(String),
     /// A map tile could not be loaded.
     Tile(String),
-    /// An OpenGL / globe rendering error.
+    /// A globe rendering error.
     Render(String),
 }
 

@@ -16,20 +16,23 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use uikit::prelude::*;
+//! use tontooui::elements::{View, VStack};
+//! use tontooui::renderer::window::run;
 //! use mapskit::prelude::*;
+//!
+//! struct MapsApp {
+//!     stack: VStack,
+//! }
 //!
 //! fn main() {
 //!     let config = MapsConfiguration::new().style(MapStyle::Light);
-//!     let map = MapViewContent::new(&config);
-//!     map.map_view().set_center(Coordinate::new(52.52, 13.405), 12.0);
-//!     map.map_view().add_annotation(
+//!     let mut map = MapView::new(&config);
+//!     map.set_center(Coordinate::new(52.52, 13.405), 12.0);
+//!     map.add_annotation(
 //!         Annotation::new(Coordinate::new(52.52, 13.405), "Berlin"),
 //!     );
-//!
-//!     let mut app = App::new("Maps", 900, 600);
-//!     app.set_root_view(View::new(map).with_frame(0.0, 0.0, 900.0, 600.0));
-//!     app.run();
+//!     // Embed the map like any other TontooUI view:
+//!     let stack = VStack::new().child(map);
 //! }
 //! ```
 //!
@@ -57,7 +60,7 @@ pub mod overlays;
 pub mod providers;
 pub mod tiles;
 pub mod types;
-pub mod uikit_view;
+pub mod tontooui_view;
 
 /// Monotonic id counter for annotations and overlays.
 pub(crate) fn next_id() -> u64 {
@@ -85,7 +88,14 @@ pub use types::{
     format_distance, format_duration, Address, BoundingBox, Coordinate, CoordinateSpan, Place,
     PlaceCategory, PlaceInfo, Route, RouteStep, TravelMode,
 };
-pub use uikit_view::{GlobeViewContent, MapViewContent};
+pub use tontooui_view::{GlobeViewContent, MapViewContent};
+
+/// Deprecated alias of [`tontooui_view`]; UIKit is removed, use
+/// `tontooui_view` instead.
+#[deprecated(note = "use tontooui_view instead; UIKit is removed")]
+pub mod uikit_view {
+    pub use crate::tontooui_view::{GlobeViewContent, MapViewContent};
+}
 
 /// Convenience re-exports for a single `use mapskit::prelude::*;`.
 pub mod prelude {

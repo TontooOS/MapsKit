@@ -25,7 +25,7 @@ pub trait MapProvider: Send + Sync {
 ```
 
 All methods are blocking HTTP calls. Call them from worker threads, not from
-the GTK main loop.
+the UI thread.
 
 ### Return values
 

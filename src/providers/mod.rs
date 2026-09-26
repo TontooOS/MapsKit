@@ -22,7 +22,7 @@ use crate::types::{Address, Coordinate, Place, Route, TravelMode};
 use std::sync::Arc;
 
 /// A map data provider. All methods are blocking; call them from worker
-/// threads, not from the GTK main loop.
+/// threads, not from the UI thread.
 pub trait MapProvider: Send + Sync {
     /// Human readable provider name (`"OpenStreetMap"`, `"Photon + CARTO"`).
     fn name(&self) -> &'static str;

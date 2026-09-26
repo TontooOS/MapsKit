@@ -3,7 +3,9 @@
 MapsKit exposes a C API from the `cdylib` for non-Rust consumers. The
 matching header lives at `Headers/mapskit.h`. Configuration is passed as a
 JSON string; service results are returned as JSON strings owned by the
-caller.
+caller. Views render inside TontooUI from Rust, so view handles are opaque
+**model** objects (camera, annotations, markers) - no widget pointers are
+handed out.
 
 ## Linking
 
@@ -48,12 +50,11 @@ char *route = tontoo_mapskit_route(52.5163, 13.3777,
 All three block on network I/O - call them from worker threads. On failure
 they return `NULL` and write a message to `error_out`.
 
-## 2D Map View
+## 2D Map Model
 
 ```c
 TontooMapView *view = tontoo_mapskit_view_new(
-    "{\"style\": \"dark\", \"shows_points_of_interest\": true}", NULL);
-GtkWidget *widget = tontoo_mapskit_view_widget(view); /* borrowed */
+    "{\"style\": \"dark\", \"shows_points_of_interest\": true}");
 
 tontoo_mapskit_view_set_center(view, 52.52, 13.405, 12.0);
 tontoo_mapskit_view_add_annotation(view,
@@ -63,16 +64,15 @@ tontoo_mapskit_view_show_user_location(view);
 tontoo_mapskit_view_free(view);
 ```
 
-Config keys: `style` (`light`, `dark`, `standard`),
-`shows_points_of_interest`, `cache_directory`, `user_agent`,
-`globe_earth_texture`. Passing `NULL` uses defaults. The view initializes
-GTK itself if the host has not done so yet.
+The handle drives the model of a Rust `MapView` (which renders inside
+TontooUI). Config keys: `style` (`light`, `dark`, `standard`,
+`satellite`), `shows_points_of_interest`, `cache_directory`,
+`user_agent`, `globe_earth_texture`. Passing `NULL` uses defaults.
 
-## 3D Globe View
+## Globe Model
 
 ```c
-TontooGlobe *globe = tontoo_mapskit_globe_new("{\"style\": \"dark\"}", NULL);
-GtkWidget *widget = tontoo_mapskit_globe_widget(globe); /* borrowed */
+TontooGlobe *globe = tontoo_mapskit_globe_new("{\"style\": \"dark\"}");
 
 tontoo_mapskit_globe_set_center(globe, 48.137, 11.575);
 tontoo_mapskit_globe_add_marker(globe, 48.137, 11.575, "Munich");
@@ -95,7 +95,6 @@ Numeric-returning functions follow this convention:
 | Rule | Detail |
 |---|---|
 | Strings | Free every returned string and every `*error_out` with `tontoo_mapskit_string_free` |
-| Widgets | Borrowed from their handle; never free directly |
 | Handles | Free exactly once with `..._view_free` / `..._globe_free`; do not use afterwards |
 | Config JSON | Owned by the caller; only read during the call |
 
@@ -104,4 +103,4 @@ Numeric-returning functions follow this convention:
 - [MapView.md](MapView.md) / [GlobeView.md](GlobeView.md) - behavior behind
   the handles
 - [Providers.md](Providers.md) - services exposed over FFI
-- [UIKit.md](UIKit.md) - the Rust-side equivalent embedding API
+- [TontooUI.md](TontooUI.md) - the Rust-side equivalent embedding API

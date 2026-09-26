@@ -2,22 +2,26 @@
  * TontooMapsKit - C API
  *
  * Maps framework for TontooOS: interactive 2D map views, place search,
- * geocoding, routing and an optional 3D globe view. Two providers are built
+ * geocoding, routing and an optional globe view. Two providers are built
  * in with automatic fallback (OpenStreetMap primary; Photon + CARTO
  * fallback). No API keys required.
  *
+ * Views render inside TontooUI from Rust. The view handles below are
+ * opaque *model* objects (camera, annotations, markers) - no widget
+ * pointers are handed out. Embed the Rust `MapView` / `GlobeView`
+ * (which implement `tontooui::elements::View`) in your TontooUI shell
+ * and drive the shared model from C through these handles.
+ *
  * All strings returned by this library are owned by the caller and must be
- * freed with tontoo_mapskit_string_free(). Widget pointers are borrowed from
- * the view handles and must not be freed directly - free the handle instead.
+ * freed with tontoo_mapskit_string_free().
  */
 
 #ifndef TONTOO_MAPSKIT_H
 #define TONTOO_MAPSKIT_H
 
-#include <glib.h>
-#include <gtk/gtk.h>
-
-G_BEGIN_DECLS
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Version                                                             */
@@ -76,24 +80,20 @@ char *tontoo_mapskit_route(double from_lat,
                            char **error_out);
 
 /* ------------------------------------------------------------------ */
-/* 2D map view                                                         */
+/* 2D map model (rendered inside TontooUI from Rust)                   */
 /* ------------------------------------------------------------------ */
 
 typedef struct _TontooMapView TontooMapView;
 
 /*
- * Create a 2D map view. config_json is a JSON object with optional keys:
- * { "style": "light" | "dark" | "standard",
+ * Create a 2D map model. config_json is a JSON object with optional keys:
+ * { "style": "light" | "dark" | "standard" | "satellite",
  *   "shows_points_of_interest": true,
  *   "cache_directory": "/path",
  *   "user_agent": "MyApp/1.0" }
- * May be NULL for defaults. Requires GTK to be initialized.
+ * May be NULL for defaults.
  */
-TontooMapView *tontoo_mapskit_view_new(const char *config_json,
-                                       char **error_out);
-
-/* The GTK4 widget of the map view (borrowed). */
-GtkWidget *tontoo_mapskit_view_widget(TontooMapView *view);
+TontooMapView *tontoo_mapskit_view_new(const char *config_json);
 
 /* Set the camera center and zoom level (0..19). */
 void tontoo_mapskit_view_set_center(TontooMapView *view,
@@ -112,21 +112,17 @@ void tontoo_mapskit_view_display_route(TontooMapView *view,
 /* Show the blue user location dot (uses CoreLocation) and center on it. */
 void tontoo_mapskit_view_show_user_location(TontooMapView *view);
 
-/* Destroy the map view handle. The widget dies with it. */
+/* Destroy the map model handle. */
 void tontoo_mapskit_view_free(TontooMapView *view);
 
 /* ------------------------------------------------------------------ */
-/* 3D globe view                                                       */
+/* Globe model (rendered inside TontooUI from Rust)                    */
 /* ------------------------------------------------------------------ */
 
 typedef struct _TontooGlobe TontooGlobe;
 
-/* Create a 3D globe view (same config keys as the map view). */
-TontooGlobe *tontoo_mapskit_globe_new(const char *config_json,
-                                      char **error_out);
-
-/* The GTK4 widget of the globe view (borrowed). */
-GtkWidget *tontoo_mapskit_globe_widget(TontooGlobe *globe);
+/* Create a globe model (same config keys as the map model). */
+TontooGlobe *tontoo_mapskit_globe_new(const char *config_json);
 
 /* Center the globe on a coordinate. */
 void tontoo_mapskit_globe_set_center(TontooGlobe *globe,
@@ -143,7 +139,7 @@ void tontoo_mapskit_globe_add_marker(TontooGlobe *globe,
 void tontoo_mapskit_globe_set_auto_rotate(TontooGlobe *globe,
                                           int enabled);
 
-/* Destroy the globe view handle. */
+/* Destroy the globe model handle. */
 void tontoo_mapskit_globe_free(TontooGlobe *globe);
 
 /* ------------------------------------------------------------------ */
@@ -153,6 +149,8 @@ void tontoo_mapskit_globe_free(TontooGlobe *globe);
 /* Free any string returned by this library or written to error_out. */
 void tontoo_mapskit_string_free(char *s);
 
-G_END_DECLS
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* TONTOO_MAPSKIT_H */

@@ -27,23 +27,19 @@ OpenStreetMap primary, Photon + CARTO fallback), so no API keys are required.
 | MapView | [MapView.md](MapView.md) | The interactive 2D map view |
 | GlobeView | [GlobeView.md](GlobeView.md) | The optional 3D globe view |
 | FFI | [Ffi.md](Ffi.md) | C API and `Headers/mapskit.h` |
-| UIKit | [UIKit.md](UIKit.md) | Embedding in UIKit apps via `ViewContent` |
+| TontooUI | [TontooUI.md](TontooUI.md) | Embedding in TontooUI apps via `View` |
 
 ## Quick Start
 
 ```rust,no_run
-use uikit::prelude::*;
+use tontooui::elements::{View, VStack};
 use mapskit::prelude::*;
 
-fn main() {
-    let config = MapsConfiguration::new().style(MapStyle::Light);
-    let map = MapViewContent::new(&config);
-    map.map_view().set_center(Coordinate::new(52.52, 13.405), 12.0);
+let mut map = MapView::new(&MapsConfiguration::new().style(MapStyle::Light));
+map.set_center(Coordinate::new(52.52, 13.405), 12.0);
 
-    let mut app = App::new("Maps", 900, 600);
-    app.set_root_view(View::new(map).with_frame(0.0, 0.0, 900.0, 600.0));
-    app.run();
-}
+// The map is a TontooUI view and embeds into any stack.
+let stack = VStack::new().child(map);
 ```
 
 Services without UI:
@@ -57,7 +53,7 @@ println!("{}", results[0].name);
 ```
 
 See [Providers.md](Providers.md), [MapView.md](MapView.md) and
-[UIKit.md](UIKit.md) for details.
+[TontooUI.md](TontooUI.md) for details.
 
 ## Architecture
 
@@ -69,32 +65,39 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
   |     +-- OsmProvider      (Nominatim + Overpass + OSRM + OSM tiles)
   |     +-- PhotonProvider   (Photon + FOSSGIS OSRM + CARTO tiles)
   |
-  +-- MapView                (GTK4 DrawingArea, Cairo tiles, pan/zoom,
+  +-- MapView                (TontooUI View, Vello tiles, pan/zoom,
   |                           satellite layer pill bottom left)
   |     +-- TileCache        (on-disk PNG cache)
   |     +-- MapCamera        (center / zoom / pitch / heading)
   |     +-- Overlays         (annotations, polylines, polygons, circles)
   |     +-- user location    (CoreLocation integration)
-  +-- GlobeView              (GTK4 GLArea + glow, textured sphere)
+  +-- GlobeView              (TontooUI View, Vello 2D globe disc)
   +-- Services               (search / geocode / route, blocking)
   |
-  +-- FFI                    (C ABI, Headers/mapskit.h)
-  +-- MapViewContent / GlobeViewContent   (uikit ViewContent wrappers)
+  +-- FFI                    (C ABI, Headers/mapskit.h, model handles)
+  +-- MapViewContent / GlobeViewContent   (owned content wrappers)
 ```
 
 ## Performance Notes
 
 - All provider calls are blocking (NetworkKit `networkkit::http`). Call them from
-  worker threads; the views already do this internally for tiles, the earth
-  texture and user location.
+  worker threads; the views already do this internally for tiles and user
+  location.
 - Tiles are cached on disk under `$XDG_CACHE_HOME/tontoos/mapskit/tiles/`
   (or the configured `cache_directory`) keyed by provider name and style.
-- The map view keeps only tiles of the current zoom level in memory; older
-  levels are evicted on zoom change.
-- The globe stitches one 4x4 grid of zoom-2 tiles (1024x1024 px) per earth
-  texture download and reuses it until `reload_earth_texture()` is called.
+  In memory the view keeps raw tile bytes of the current style; TontooUI's
+  `ImageLoader` caches decoded uploads per tile.
+- The globe draws a procedural ocean disc with a graticule and needs no
+  downloaded imagery.
 
 ## Changelog
+
+- 2026-09-26: Ported from GTK4/UIKit to TontooUI (Vello/WGPU). `MapView`
+  and `GlobeView` implement `tontooui::elements::View` directly and embed
+  into any stack; tile bytes are decoded through TontooUI `ImageLoader`;
+  the globe is a procedural 2D disc (no OpenGL); the C FFI exposes model
+  handles instead of GTK widgets; `glow`, `gtk4`, `glib` and `uikit`
+  dependencies are removed.
 
 - 2026-09-26: HTTP transport moved to NetworkKit (`networkkit::http` with a
   shared `HttpClient` session per provider, query building via the `url`

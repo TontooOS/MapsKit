@@ -1,9 +1,15 @@
 # MapView
 
 `MapView` is the interactive 2D map view, following Apple's `MKMapView`. It
-renders slippy map tiles with Cairo, supports pan and zoom, draws overlays
-and annotations, shows the user location via CoreLocation and displays
-routes.
+renders slippy map tiles with Vello inside TontooUI, supports pan and zoom,
+draws overlays and annotations, shows the user location via CoreLocation
+and displays routes.
+
+The view implements `tontooui::elements::View` directly and embeds into any
+stack. It is `Clone`: clones share one model through an `Arc<Mutex<..>>`,
+so worker threads and button callbacks can drive it while the shell draws
+it. The host `App` must forward `mouse_down` / `mouse_up` / `mouse_wheel`
+and `mouse_move` (as `set_hover`); see [TontooUI.md](TontooUI.md).
 
 ## Creating
 
@@ -14,7 +20,8 @@ let map = MapView::new(&MapsConfiguration::new().style(MapStyle::Light));
 map.set_center(Coordinate::new(52.52, 13.405), 12.0);
 map.add_annotation(Annotation::new(Coordinate::new(52.52, 13.405), "Berlin"));
 
-// map.widget() embeds into GTK containers or UIKit views.
+// The map implements tontooui::elements::View and embeds into any stack.
+let stack = VStack::new().child(map);
 ```
 
 ## Gestures
@@ -22,14 +29,13 @@ map.add_annotation(Annotation::new(Coordinate::new(52.52, 13.405), "Berlin"));
 | Input | Action |
 |---|---|
 | Drag | Pan (content follows the pointer) |
-| Scroll | Zoom by one level around the viewport center |
-| Double click | Zoom in around the click position |
+| Scroll | Zoom around the hover anchor (one notch is one level) |
 | Tap on a pin | Fires the annotation-tapped callback |
 | Tap on layer pill (bottom left) | Switch between satellite imagery and the base style |
 
-GTK reports drag offsets cumulatively from the gesture start. The view
-therefore applies only the delta since the last motion event, so panning
-speed matches the pointer one-to-one and never accelerates during long drags.
+Panning tracks the hover position between press and release and applies
+only the delta since the last motion event, so panning speed matches the
+pointer one-to-one and never accelerates during long drags.
 
 The layer pill at the bottom left shows the name of the layer it switches to
 ("Satellite" in map mode, "Standard" in satellite mode) and uses the
@@ -103,7 +109,10 @@ map.on_camera_changed(|camera: &MapCamera| {
 # }
 ```
 
-Callbacks run on the main thread during input handling.
+Callbacks run on the calling thread during input handling. They are cloned
+out of the lock before invocation, so a callback may call back into the
+view (e.g. `clear_annotations`) without deadlocking. Callbacks must be
+`Send + Sync` because the model is shared with worker threads.
 
 ## User Location
 
@@ -126,22 +135,25 @@ CoreLocation failures are only logged when `MAPSKIT_DEBUG=1`.
 
 - Visible tiles are requested during the draw pass; missing ones spawn one
   worker thread each.
-- Results return over an async channel onto the main loop, decode into
-  pixbufs and trigger a redraw.
-- In-memory tiles of other zoom levels are evicted on zoom change; disk
-  caching is handled by [`Tiles`](Tiles.md).
+- Threads fetch through the disk cache and write raw bytes into shared
+  state. The TontooUI shell redraws continuously, so tiles appear on the
+  next frame with no explicit invalidation.
+- `ImageLoader::raster` decodes and uploads each tile once per cache key
+  (`mapskit/<provider>/<source>/<z>/<x>/<y>`).
+- Switching the base style drops all cached tiles of the old layer.
 - While loading, placeholder rectangles tinted per style are drawn; after a
   failure an offline badge appears top-left.
 
 ## Background Colors
 
-Per TontooOS design rules the view background follows the style: dark uses
-`#1d1d1d`, light uses `#ececec`. Labels use SF Pro Text with automatic
-fallback when the font is not installed.
+Per TontooOS design rules the view background follows the style: dark and
+satellite use `#1b2022`, light and standard use `#ffffff`. Text (labels,
+badges, pills) renders through the system font stack, so SF Pro resolves
+on TontooOS with automatic fallback elsewhere.
 
 ## Cross References
 
 - [Camera.md](Camera.md) - the viewport object behind the gestures
 - [Overlays.md](Overlays.md) - overlay types and drawing details
 - [Tiles.md](Tiles.md) - fetching and caching behavior
-- [UIKit.md](UIKit.md) - embedding as `MapViewContent`
+- [TontooUI.md](TontooUI.md) - embedding as a `View` or `MapViewContent`

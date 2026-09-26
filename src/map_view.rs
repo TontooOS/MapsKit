@@ -1,19 +1,27 @@
 //! `MapView` — the interactive 2D map view, following Apple's `MKMapView`.
 //!
-//! The view renders slippy map tiles with Cairo, supports pan (drag), zoom
-//! (scroll wheel, double click) and draws annotations, polylines, polygons
-//! and circles. Tiles are fetched on worker threads and handed back to the
-//! GTK main loop through a channel, so the UI never blocks.
+//! The view renders slippy map tiles with Vello inside TontooUI, supports
+//! pan (drag), zoom (scroll wheel) and draws annotations, polylines,
+//! polygons and circles. Tiles are fetched on worker threads into shared
+//! state; the TontooUI shell redraws continuously, so freshly fetched
+//! tiles appear on the next frame without any explicit invalidation.
+//!
+//! `MapView` implements [`tontooui::elements::View`][tontooui-view] directly,
+//! so it drops into any `VStack` / `HStack` / `ZStack` like a label or a
+//! button:
 //!
 //! ```rust,no_run
+//! use tontooui::elements::{View, VStack};
 //! use mapskit::prelude::*;
 //!
-//! let map = MapView::new(&MapsConfiguration::new().style(MapStyle::Light));
+//! let mut map = MapView::new(&MapsConfiguration::new().style(MapStyle::Light));
 //! map.set_center(Coordinate::new(52.52, 13.405), 12.0);
 //! map.add_annotation(Annotation::new(Coordinate::new(52.52, 13.405), "Berlin"));
 //!
-//! // map.widget() can be embedded in any GTK4 container or UIKit view.
+//! let stack = VStack::new().child(map);
 //! ```
+//!
+//! [tontooui-view]: https://docs.rs/tontooui/latest/tontooui/elements/layout/trait.View.html
 
 use crate::camera::MapCamera;
 use crate::config::{MapStyle, MapsConfiguration};
@@ -22,24 +30,37 @@ use crate::providers::ProviderChain;
 use crate::tiles::{self, TileCache, TileKey};
 use crate::types::{Coordinate, MapRegion, Route};
 
-use gdk_pixbuf::Pixbuf;
-use gtk::gdk::prelude::GdkCairoContextExt;
-use gtk::prelude::*;
-use gtk::{DrawingArea, EventControllerScroll, GestureClick, GestureDrag};
-use std::cell::RefCell;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use tontooui::elements::layout::View as TontooView;
+use tontooui::renderer::images::ImageLoader;
+use tontooui::renderer::text::{FontSystem, draw_layout};
+use vello::Scene;
+use vello::kurbo::{Affine, BezPath, Circle as KurboCircle, RoundedRect, Stroke};
+use vello::peniko::{Brush, Color, Fill};
 
 const TILE_SIZE: f64 = 256.0;
-const ACCENT: (f64, f64, f64) = (1.0, 0.42, 0.17); // TontooOS orange #FF6B2B
+/// TontooOS orange accent (`#FF6B2B`) used for pins and routes.
+const ACCENT: (f64, f64, f64) = (1.0, 0x6b as f64 / 255.0, 0x2b as f64 / 255.0);
 
-/// Background colors per style (TontooOS dark/light surfaces).
-fn background_for_style(style: MapStyle) -> (f64, f64, f64) {
+/// Background color per style (TontooOS surfaces: dark `#1b2022`,
+/// light `#ffffff`).
+fn background_for_style(style: MapStyle) -> Color {
     match style {
-        MapStyle::Dark => (0x1d as f64 / 255.0, 0x1d as f64 / 255.0, 0x1d as f64 / 255.0),
-        _ => (0xec as f64 / 255.0, 0xec as f64 / 255.0, 0xec as f64 / 255.0),
+        MapStyle::Dark | MapStyle::Satellite => Color::from_rgb8(0x1b, 0x20, 0x22),
+        _ => Color::from_rgb8(0xff, 0xff, 0xff),
     }
+}
+
+fn rgba8(color: (f64, f64, f64, f64)) -> Color {
+    Color::from_rgba8(
+        (color.0.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.1.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.2.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.3.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
 }
 
 fn log_debug(message: &str) {
@@ -48,23 +69,27 @@ fn log_debug(message: &str) {
     }
 }
 
-struct MapState {
+type AnnotationCallback = Arc<dyn Fn(&Annotation) + Send + Sync>;
+type CameraCallback = Arc<dyn Fn(&MapCamera) + Send + Sync>;
+
+struct MapInner {
     config: MapsConfiguration,
     chain: Arc<ProviderChain>,
     camera: MapCamera,
     /// The currently rendered base map style (switchable at runtime).
     style: MapStyle,
-    tiles: HashMap<TileKey, Option<Pixbuf>>,
+    /// Raw PNG/JPEG tile bytes by key (`None` = failed, draws a placeholder).
+    tiles: HashMap<TileKey, Option<Vec<u8>>>,
     pending: HashSet<TileKey>,
     annotations: Vec<Annotation>,
     overlays: Vec<Overlay>,
-    dragging: Option<(f64, f64)>,
+    /// Last mouse press in view-logical px (for tap vs. drag detection).
+    press: Option<(f64, f64)>,
+    /// Last hover position in view-logical px (for drag deltas).
+    last_hover: Option<(f64, f64)>,
     drag_moved: bool,
-    /// Last processed cumulative drag offset, so `drag_update` deltas are
-    /// applied exactly once (GTK reports offsets from the drag start).
-    last_drag_offset: Option<(f64, f64)>,
     /// Screen rect of the layer toggle pill, refreshed on every frame.
-    toggle_rect: std::cell::Cell<Option<(f64, f64, f64, f64)>>,
+    toggle_rect: Option<(f64, f64, f64, f64)>,
     /// Whether the active press started on the layer toggle.
     toggle_active: bool,
     width: f64,
@@ -72,11 +97,11 @@ struct MapState {
     offline: bool,
     /// The user's location, when shown via `show_user_location`.
     user_location: Option<Coordinate>,
-    on_annotation_tapped: Option<Box<dyn Fn(&Annotation)>>,
-    on_camera_changed: Option<Box<dyn Fn(&MapCamera)>>,
+    on_annotation_tapped: Option<AnnotationCallback>,
+    on_camera_changed: Option<CameraCallback>,
 }
 
-impl MapState {
+impl MapInner {
     /// The provider serving base map tiles for the active style.
     fn tile_provider(&self) -> Arc<dyn crate::providers::MapProvider> {
         self.chain.tile_provider_for(self.style).cloned().unwrap_or_else(|| {
@@ -127,7 +152,9 @@ impl MapState {
         let wy = y / scale + origin_y;
         let n = f64::from(1u32 << z);
         let lon = wx / TILE_SIZE / n * 360.0 - 180.0;
-        let lat = ((std::f64::consts::PI * (1.0 - 2.0 * wy / TILE_SIZE / n)).sinh()).atan().to_degrees();
+        let lat = ((std::f64::consts::PI * (1.0 - 2.0 * wy / TILE_SIZE / n)).sinh())
+            .atan()
+            .to_degrees();
         Coordinate::new(lat.clamp(-85.051_128_78, 85.051_128_78), lon)
     }
 
@@ -151,8 +178,9 @@ impl MapState {
         let center_wy = origin_y + self.height / 2.0;
         let n = f64::from(1u32 << z);
         let lon = center_wx / TILE_SIZE / n * 360.0 - 180.0;
-        let lat =
-            ((std::f64::consts::PI * (1.0 - 2.0 * center_wy / TILE_SIZE / n)).sinh()).atan().to_degrees();
+        let lat = ((std::f64::consts::PI * (1.0 - 2.0 * center_wy / TILE_SIZE / n)).sinh())
+            .atan()
+            .to_degrees();
         self.camera.center = Coordinate::new(
             lat.clamp(-85.051_128_78, 85.051_128_78),
             lon.clamp(-180.0, 180.0),
@@ -187,7 +215,7 @@ impl MapState {
 
     /// Whether the point is inside the layer toggle pill.
     fn toggle_hit(&self, x: f64, y: f64) -> bool {
-        match self.toggle_rect.get() {
+        match self.toggle_rect {
             Some((rx, ry, rw, rh)) => x >= rx && x <= rx + rw && y >= ry && y <= ry + rh,
             None => false,
         }
@@ -206,9 +234,14 @@ impl MapState {
 }
 
 /// Requests all visible tiles that are not loaded yet.
-fn request_visible_tiles(state: &Rc<RefCell<MapState>>, area: &DrawingArea) {
+///
+/// Snapshots the wanted keys plus provider details under the lock, then
+/// spawns one worker thread per tile. Threads write back into the shared
+/// state directly; the TontooUI shell redraws continuously, so no explicit
+/// invalidation is needed.
+fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
     let (wanted, provider_name, cache_source, user_agent, timeout, cache_config) = {
-        let s = state.borrow();
+        let Ok(s) = shared.lock() else { return };
         let zoom = s.camera.zoom.round() as u8;
         let scale = (s.camera.zoom - f64::from(zoom)).exp2();
 
@@ -247,60 +280,45 @@ fn request_visible_tiles(state: &Rc<RefCell<MapState>>, area: &DrawingArea) {
         return;
     }
 
-    let (sender, receiver) = async_channel::unbounded::<(TileKey, Result<Vec<u8>, String>)>();
+    let chain = {
+        let Ok(s) = shared.lock() else { return };
+        s.chain.clone()
+    };
+    let style = {
+        let Ok(s) = shared.lock() else { return };
+        s.style
+    };
 
     for key in wanted {
-        let inserted = {
-            let mut s = state.borrow_mut();
+        {
+            let Ok(mut s) = shared.lock() else { break };
             if s.pending.contains(&key) || s.tiles.contains_key(&key) {
-                false
-            } else {
-                s.pending.insert(key);
-                true
+                continue;
             }
-        };
-        if !inserted {
-            continue;
+            s.pending.insert(key);
         }
 
-        let provider = {
-            let s = state.borrow();
-            s.chain.tile_provider_for(s.style).cloned().expect("chain empty")
-        };
-
-        let sender = sender.clone();
+        let shared = shared.clone();
+        let chain = chain.clone();
         let provider_name = provider_name.clone();
         let cache_source = cache_source.clone();
         let user_agent = user_agent.clone();
         let cache_config = cache_config.clone();
         std::thread::spawn(move || {
+            let provider = chain.tile_provider_for(style).cloned().unwrap_or_else(|| {
+                chain
+                    .tile_provider_for(MapStyle::Standard)
+                    .cloned()
+                    .expect("chain empty")
+            });
             let cache = TileCache::new(&cache_config, &provider_name, &cache_source);
-            let result =
-                tiles::fetch_tile(provider.as_ref(), &cache, key, &user_agent, timeout)
-                    .map_err(|e| e.to_string());
-            let _ = sender.send_blocking((key, result));
-        });
-    }
-    drop(sender);
-
-    let state_rc = state.clone();
-    let area = area.clone();
-    glib::spawn_future_local(async move {
-        while let Ok((key, result)) = receiver.recv().await {
-            {
-                let mut s = state_rc.borrow_mut();
+            let result = tiles::fetch_tile(provider.as_ref(), &cache, key, &user_agent, timeout);
+            if let Ok(mut s) = shared.lock() {
                 s.pending.remove(&key);
                 match result {
                     Ok(bytes) => {
                         s.offline = false;
-                        let loader = gdk_pixbuf::PixbufLoader::new();
-                        let decoded = loader
-                            .write(&bytes)
-                            .is_ok()
-                            .then(|| loader.close().ok())
-                            .flatten()
-                            .and_then(|_| loader.pixbuf());
-                        s.tiles.insert(key, decoded);
+                        s.tiles.insert(key, Some(bytes));
                     }
                     Err(e) => {
                         s.offline = true;
@@ -312,93 +330,74 @@ fn request_visible_tiles(state: &Rc<RefCell<MapState>>, area: &DrawingArea) {
                     }
                 }
             }
-            area.queue_draw();
-        }
-    });
+        });
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Rendering
+// Vello rendering (all geometry in physical px: logical * dpr)
 // ═══════════════════════════════════════════════════════════════
 
-fn render(state: &MapState, ctx: &gtk::cairo::Context) {
-    let (bg_r, bg_g, bg_b) = background_for_style(state.style);
-    ctx.set_source_rgb(bg_r, bg_g, bg_b);
-    ctx.paint().ok();
-
-    draw_tiles(state, ctx);
-    draw_overlays(state, ctx);
-    draw_user_location(state, ctx);
-    draw_annotations(state, ctx);
-    draw_badges(state, ctx);
-    draw_layer_toggle(state, ctx);
+/// Cache key for a tile inside TontooUI's [`ImageLoader`].
+fn tile_image_key(provider: &str, source: &str, key: TileKey) -> String {
+    format!("mapskit/{provider}/{source}/{}/{}/{}", key.z, key.x, key.y)
 }
 
-/// The blue pulsing-dot style user location marker.
-fn draw_user_location(state: &MapState, ctx: &gtk::cairo::Context) {
-    let Some(coordinate) = state.user_location else {
-        return;
-    };
-    let (sx, sy) = state.coord_to_screen(coordinate);
+fn draw_tiles(
+    inner: &MapInner,
+    scene: &mut Scene,
+    images: &mut ImageLoader<'_>,
+    dpr: f64,
+    ox: f64,
+    oy: f64,
+) {
+    let z = inner.camera.zoom.round() as u8;
+    let zoom_scale = (inner.camera.zoom - f64::from(z)).exp2();
+    let tile_draw = TILE_SIZE * zoom_scale;
 
-    // Accuracy halo.
-    let z = state.camera.zoom.round() as u8;
-    let mpp = tiles::meters_per_pixel(z, coordinate.latitude);
-    let scale = (state.camera.zoom - f64::from(z)).exp2();
-    let halo_px = 50.0 / mpp.max(0.5) * scale;
-    ctx.set_source_rgba(0.10, 0.45, 0.95, 0.15);
-    ctx.new_path();
-    ctx.arc(sx, sy, halo_px.clamp(12.0, 200.0), 0.0, std::f64::consts::TAU);
-    ctx.fill().ok();
-
-    // White ring + blue core.
-    ctx.set_source_rgb(1.0, 1.0, 1.0);
-    ctx.new_path();
-    ctx.arc(sx, sy, 7.0, 0.0, std::f64::consts::TAU);
-    ctx.fill().ok();
-    ctx.set_source_rgb(0.10, 0.50, 1.0);
-    ctx.new_path();
-    ctx.arc(sx, sy, 5.5, 0.0, std::f64::consts::TAU);
-    ctx.fill().ok();
-}
-
-fn draw_tiles(state: &MapState, ctx: &gtk::cairo::Context) {
-    let z = state.camera.zoom.round() as u8;
-    let scale = (state.camera.zoom - f64::from(z)).exp2();
-    let tile_draw_size = TILE_SIZE * scale;
-
-    let (cx, cy) = state.world_px(state.camera.center);
-    let origin_x = cx - state.width / 2.0;
-    let origin_y = cy - state.height / 2.0;
+    let (cx, cy) = inner.world_px(inner.camera.center);
+    let origin_x = cx - inner.width / 2.0;
+    let origin_y = cy - inner.height / 2.0;
 
     let max_tiles = (1u32 << z) as i64;
     let min_tx = (origin_x / TILE_SIZE).floor().max(0.0) as i64;
-    let max_tx = (((origin_x + state.width) / TILE_SIZE).floor() as i64).min(max_tiles - 1);
+    let max_tx = (((origin_x + inner.width) / TILE_SIZE).floor() as i64).min(max_tiles - 1);
     let min_ty = (origin_y / TILE_SIZE).floor().max(0.0) as i64;
-    let max_ty = (((origin_y + state.height) / TILE_SIZE).floor() as i64).min(max_tiles - 1);
+    let max_ty = (((origin_y + inner.height) / TILE_SIZE).floor() as i64).min(max_tiles - 1);
+
+    let provider = inner.tile_provider();
+    let source = tiles::cache_source_key(provider.as_ref());
+    let provider_name = provider.name().to_string();
 
     for ty in min_ty..=max_ty {
         for tx in min_tx..=max_tx {
             let key = TileKey::new(z, tx as u32, ty as u32);
-            let screen_x = tx as f64 * TILE_SIZE - origin_x;
-            let screen_y = ty as f64 * TILE_SIZE - origin_y;
-            match state.tiles.get(&key) {
-                Some(Some(pixbuf)) => {
-                    ctx.save().ok();
-                    ctx.scale(scale, scale);
-                    ctx.set_source_pixbuf(pixbuf, screen_x / scale, screen_y / scale);
-                    ctx.paint().ok();
-                    ctx.restore().ok();
+            let lx = ox + (tx as f64 * TILE_SIZE - origin_x) * zoom_scale;
+            let ly = oy + (ty as f64 * TILE_SIZE - origin_y) * zoom_scale;
+            match inner.tiles.get(&key) {
+                Some(Some(bytes)) => {
+                    let cache_key = tile_image_key(&provider_name, &source, key);
+                    if let Some((image, iw, _ih)) = images.raster(&cache_key, bytes, 512) {
+                        let s = (tile_draw / iw as f64) * dpr;
+                        let transform = Affine::translate((lx * dpr, ly * dpr)) * Affine::scale(s);
+                        scene.draw_image(&image, transform);
+                    }
                 }
                 _ => {
                     // Placeholder while loading.
-                    let (r, g, b, a) = match state.style {
-                        MapStyle::Dark => (1.0, 1.0, 1.0, 0.05),
-                        _ => (0.0, 0.0, 0.0, 0.06),
+                    let fill = match inner.style {
+                        MapStyle::Dark | MapStyle::Satellite => {
+                            Color::from_rgba8(255, 255, 255, 13)
+                        }
+                        _ => Color::from_rgba8(0, 0, 0, 15),
                     };
-                    ctx.set_source_rgba(r, g, b, a);
-                    ctx.rectangle(screen_x, screen_y, tile_draw_size, tile_draw_size);
-                    ctx.fill().ok();
+                    let rect = vello::kurbo::Rect::new(
+                        lx * dpr,
+                        ly * dpr,
+                        (lx + tile_draw) * dpr,
+                        (ly + tile_draw) * dpr,
+                    );
+                    scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(fill), None, &rect);
                 }
             }
         }
@@ -432,508 +431,480 @@ fn parse_css_color(color: &str, fallback: (f64, f64, f64)) -> (f64, f64, f64, f6
     (fallback.0, fallback.1, fallback.2, 1.0)
 }
 
-fn draw_overlays(state: &MapState, ctx: &gtk::cairo::Context) {
-    for overlay in &state.overlays {
+fn screen_path(points: &[(f64, f64)], ox: f64, oy: f64, dpr: f64, close: bool) -> BezPath {
+    let mut path = BezPath::new();
+    for (i, (sx, sy)) in points.iter().enumerate() {
+        let (px, py) = ((ox + sx) * dpr, (oy + sy) * dpr);
+        if i == 0 {
+            path.move_to((px, py));
+        } else {
+            path.line_to((px, py));
+        }
+    }
+    if close {
+        path.close_path();
+    }
+    path
+}
+
+fn draw_overlays(inner: &MapInner, scene: &mut Scene, dpr: f64, ox: f64, oy: f64) {
+    for overlay in &inner.overlays {
         match overlay {
             Overlay::Polyline(line) => {
                 if line.points.len() < 2 {
                     continue;
                 }
-                let (r, g, b, a) = parse_css_color(&line.color, ACCENT);
-                ctx.set_source_rgba(r, g, b, a);
-                ctx.set_line_width(line.width);
-                ctx.set_line_cap(gtk::cairo::LineCap::Round);
-                ctx.set_line_join(gtk::cairo::LineJoin::Round);
-                let mut first = true;
-                for point in &line.points {
-                    let (sx, sy) = state.coord_to_screen(*point);
-                    if first {
-                        ctx.move_to(sx, sy);
-                        first = false;
-                    } else {
-                        ctx.line_to(sx, sy);
-                    }
-                }
-                ctx.stroke().ok();
+                let pts: Vec<(f64, f64)> =
+                    line.points.iter().map(|p| inner.coord_to_screen(*p)).collect();
+                let path = screen_path(&pts, ox, oy, dpr, false);
+                let color = rgba8(parse_css_color(&line.color, ACCENT));
+                scene.stroke(
+                    &Stroke::new((line.width as f64 * dpr).max(1.0)),
+                    Affine::IDENTITY,
+                    &Brush::Solid(color),
+                    None,
+                    &path,
+                );
             }
             Overlay::Polygon(polygon) => {
                 if polygon.points.len() < 3 {
                     continue;
                 }
-                ctx.save().ok();
-                let mut first = true;
-                for point in &polygon.points {
-                    let (sx, sy) = state.coord_to_screen(*point);
-                    if first {
-                        ctx.move_to(sx, sy);
-                        first = false;
-                    } else {
-                        ctx.line_to(sx, sy);
-                    }
-                }
-                ctx.close_path();
+                let pts: Vec<(f64, f64)> =
+                    polygon.points.iter().map(|p| inner.coord_to_screen(*p)).collect();
+                let path = screen_path(&pts, ox, oy, dpr, true);
                 if !polygon.fill_color.is_empty() {
-                    let (r, g, b, a) = parse_css_color(&polygon.fill_color, ACCENT);
-                    ctx.set_source_rgba(r, g, b, a);
-                    ctx.fill_preserve().ok();
+                    let color = rgba8(parse_css_color(&polygon.fill_color, ACCENT));
+                    scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(color), None, &path);
                 }
                 if !polygon.stroke_color.is_empty() {
-                    let (r, g, b, a) = parse_css_color(&polygon.stroke_color, ACCENT);
-                    ctx.set_source_rgba(r, g, b, a);
-                    ctx.set_line_width(2.0);
-                    ctx.stroke().ok();
+                    let color = rgba8(parse_css_color(&polygon.stroke_color, ACCENT));
+                    scene.stroke(
+                        &Stroke::new(2.0 * dpr),
+                        Affine::IDENTITY,
+                        &Brush::Solid(color),
+                        None,
+                        &path,
+                    );
                 }
-                ctx.restore().ok();
             }
             Overlay::Circle(circle) => {
-                draw_circle(state, ctx, circle);
+                draw_circle(inner, scene, circle, dpr, ox, oy);
             }
         }
     }
 }
 
-fn draw_circle(state: &MapState, ctx: &gtk::cairo::Context, circle: &CircleOverlay) {
+fn draw_circle(
+    inner: &MapInner,
+    scene: &mut Scene,
+    circle: &CircleOverlay,
+    dpr: f64,
+    ox: f64,
+    oy: f64,
+) {
     // Convert the radius in meters to pixels at the center latitude.
-    let z = state.camera.zoom.round() as u8;
+    let z = inner.camera.zoom.round() as u8;
     let mpp = tiles::meters_per_pixel(z, circle.center.latitude);
-    let scale = (state.camera.zoom - f64::from(z)).exp2();
+    let scale = (inner.camera.zoom - f64::from(z)).exp2();
     let radius_px = circle.radius_m / mpp.max(0.01) * scale;
-    let (sx, sy) = state.coord_to_screen(circle.center);
+    let (sx, sy) = inner.coord_to_screen(circle.center);
+    let shape = KurboCircle::new(((ox + sx) * dpr, (oy + sy) * dpr), radius_px.max(2.0) * dpr);
 
-    ctx.save().ok();
-    ctx.new_path();
-    ctx.arc(sx, sy, radius_px.max(2.0), 0.0, std::f64::consts::TAU);
     if !circle.fill_color.is_empty() {
-        let (r, g, b, a) = parse_css_color(&circle.fill_color, (0.0, 0.9, 1.0));
-        ctx.set_source_rgba(r, g, b, a);
-        ctx.fill_preserve().ok();
+        let color = rgba8(parse_css_color(&circle.fill_color, (0.0, 0.9, 1.0)));
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(color), None, &shape);
     }
     if !circle.stroke_color.is_empty() {
-        let (r, g, b, a) = parse_css_color(&circle.stroke_color, (0.0, 0.9, 1.0));
-        ctx.set_source_rgba(r, g, b, a);
-        ctx.set_line_width(2.0);
-        ctx.stroke().ok();
+        let color = rgba8(parse_css_color(&circle.stroke_color, (0.0, 0.9, 1.0)));
+        scene.stroke(
+            &Stroke::new(2.0 * dpr),
+            Affine::IDENTITY,
+            &Brush::Solid(color),
+            None,
+            &shape,
+        );
     }
-    ctx.restore().ok();
 }
 
-fn draw_annotations(state: &MapState, ctx: &gtk::cairo::Context) {
-    ctx.select_font_face(
-        "SF Pro Text",
-        gtk::cairo::FontSlant::Normal,
-        gtk::cairo::FontWeight::Normal,
-    );
-    ctx.set_font_size(12.0);
+/// The blue user location dot with an accuracy halo.
+fn draw_user_location(inner: &MapInner, scene: &mut Scene, dpr: f64, ox: f64, oy: f64) {
+    let Some(coordinate) = inner.user_location else {
+        return;
+    };
+    let (sx, sy) = inner.coord_to_screen(coordinate);
+    let (px, py) = ((ox + sx) * dpr, (oy + sy) * dpr);
 
-    for annotation in &state.annotations {
-        let (sx, sy) = state.coord_to_screen(annotation.coordinate);
-        if sx < -40.0 || sy < -60.0 || sx > state.width + 40.0 || sy > state.height + 60.0 {
+    let z = inner.camera.zoom.round() as u8;
+    let mpp = tiles::meters_per_pixel(z, coordinate.latitude);
+    let scale = (inner.camera.zoom - f64::from(z)).exp2();
+    let halo_px = (50.0 / mpp.max(0.5) * scale).clamp(12.0, 200.0) * dpr;
+    let halo = KurboCircle::new((px, py), halo_px);
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &Brush::Solid(Color::from_rgba8(26, 115, 242, 38)),
+        None,
+        &halo,
+    );
+
+    let ring = KurboCircle::new((px, py), 7.0 * dpr);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(Color::WHITE), None, &ring);
+    let core = KurboCircle::new((px, py), 5.5 * dpr);
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &Brush::Solid(Color::from_rgb8(26, 128, 255)),
+        None,
+        &core,
+    );
+}
+
+fn draw_annotations(
+    inner: &MapInner,
+    scene: &mut Scene,
+    fonts: &mut FontSystem,
+    dpr: f64,
+    ox: f64,
+    oy: f64,
+) {
+    for annotation in &inner.annotations {
+        let (sx, sy) = inner.coord_to_screen(annotation.coordinate);
+        if sx < -40.0 || sy < -60.0 || sx > inner.width + 40.0 || sy > inner.height + 60.0 {
             continue;
         }
+        let (px, py) = ((ox + sx) * dpr, (oy + sy) * dpr);
 
-        let accent = if annotation.selected {
-            (1.0, 0.55, 0.35)
+        let (ar, ag, ab) = if annotation.selected {
+            (255u8, 140u8, 89u8)
         } else {
-            ACCENT
+            (255, 0x6b, 0x2b)
         };
+        let pin_color = Color::from_rgb8(ar, ag, ab);
 
-        // Pin shadow
-        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.25);
-        ctx.new_path();
-        ctx.arc(sx, sy - 14.0, 7.5, 0.0, std::f64::consts::TAU);
-        ctx.fill().ok();
+        // Pin shadow.
+        let shadow = KurboCircle::new((px, (oy + sy - 14.0) * dpr), 7.5 * dpr);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &Brush::Solid(Color::from_rgba8(0, 0, 0, 64)),
+            None,
+            &shadow,
+        );
+        // Pin head.
+        let head = KurboCircle::new((px, (oy + sy - 14.0) * dpr), 7.0 * dpr);
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(pin_color), None, &head);
+        // Pin tip.
+        let mut tip = BezPath::new();
+        tip.move_to(((ox + sx - 3.0) * dpr, (oy + sy - 9.0) * dpr));
+        tip.line_to((px, py));
+        tip.line_to(((ox + sx + 3.0) * dpr, (oy + sy - 9.0) * dpr));
+        tip.close_path();
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(pin_color), None, &tip);
 
-        // Pin head
-        ctx.set_source_rgb(accent.0, accent.1, accent.2);
-        ctx.new_path();
-        ctx.arc(sx, sy - 14.0, 7.0, 0.0, std::f64::consts::TAU);
-        ctx.fill().ok();
-
-        // Pin tip
-        ctx.new_path();
-        ctx.move_to(sx - 3.0, sy - 9.0);
-        ctx.line_to(sx, sy);
-        ctx.line_to(sx + 3.0, sy - 9.0);
-        ctx.close_path();
-        ctx.fill().ok();
-
-        // Label plate
-        let title = &annotation.title;
-        let (text_x, text_y, text_w, text_h) = ctx.text_extents(title).map(|e| {
-            (sx + 10.0, sy - 20.0, e.width(), e.height())
-        }).unwrap_or((sx + 10.0, sy - 20.0, 40.0, 10.0));
-
-        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.55);
-        rounded_rect(ctx, text_x - 5.0, text_y - 3.0, text_w + 10.0, text_h + 8.0, 5.0);
-        ctx.fill().ok();
-
-        ctx.set_source_rgb(1.0, 1.0, 1.0);
-        ctx.move_to(text_x, text_y + text_h);
-        ctx.show_text(title).ok();
+        // Label plate.
+        if !annotation.title.is_empty() {
+            let layout = fonts.layout_text(&annotation.title, 12.0, Color::WHITE, None);
+            let (lw, lh) = FontSystem::layout_size(&layout);
+            let (lw, lh) = (lw / fonts.scale, lh / fonts.scale);
+            let pad_x: f32 = 5.0;
+            let pad_y: f32 = 3.0;
+            let bx = (ox + sx + 10.0) * dpr - pad_x as f64 * dpr;
+            let by = (oy + sy - 20.0) * dpr - pad_y as f64 * dpr;
+            let plate = RoundedRect::new(
+                bx,
+                by,
+                bx + (lw + pad_x * 2.0) as f64 * dpr,
+                by + (lh + pad_y * 2.0) as f64 * dpr,
+                5.0 * dpr,
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                &Brush::Solid(Color::from_rgba8(0, 0, 0, 140)),
+                None,
+                &plate,
+            );
+            draw_layout(
+                scene,
+                &layout,
+                (ox + sx + 10.0) as f32,
+                (oy + sy - 20.0) as f32,
+                fonts.scale,
+            );
+        }
     }
 }
 
-fn rounded_rect(ctx: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    ctx.new_path();
-    ctx.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
-    ctx.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
-    ctx.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
-    ctx.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
-    ctx.close_path();
-}
-
-fn draw_badges(state: &MapState, ctx: &gtk::cairo::Context) {
-    ctx.select_font_face(
-        "SF Pro Text",
-        gtk::cairo::FontSlant::Normal,
-        gtk::cairo::FontWeight::Normal,
+/// Draws a small pill badge with text; returns its logical rect.
+fn draw_pill(
+    scene: &mut Scene,
+    fonts: &mut FontSystem,
+    text: &str,
+    size: f32,
+    x: f32,
+    y: f32,
+    fill: Color,
+    fg: Color,
+) -> (f32, f32, f32, f32) {
+    let layout = fonts.layout_text(text, size, fg, None);
+    let (lw, lh) = FontSystem::layout_size(&layout);
+    let (lw, lh) = (lw / fonts.scale, lh / fonts.scale);
+    let pad_x = 6.0;
+    let pad_y = 3.0;
+    let dpr = fonts.scale as f64;
+    let plate = RoundedRect::new(
+        x as f64 * dpr,
+        y as f64 * dpr,
+        (x + lw + pad_x * 2.0) as f64 * dpr,
+        (y + lh + pad_y * 2.0) as f64 * dpr,
+        4.0 * dpr,
     );
-    ctx.set_font_size(10.0);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(fill), None, &plate);
+    draw_layout(scene, &layout, x + pad_x, y + pad_y, fonts.scale);
+    (x, y, lw + pad_x * 2.0, lh + pad_y * 2.0)
+}
 
+fn draw_badges(
+    inner: &MapInner,
+    scene: &mut Scene,
+    fonts: &mut FontSystem,
+    ox: f32,
+    oy: f32,
+    w: f32,
+    h: f32,
+) {
     // Attribution bottom-right.
-    let attribution = crate::lang::t_or(state.attribution_key(), "\u{a9} OpenStreetMap contributors");
-    if let Ok(extents) = ctx.text_extents(&attribution) {
-        let pad = 6.0;
-        let w = extents.width() + pad * 2.0;
-        let h = extents.height() + pad;
-        let x = state.width - w - 4.0;
-        let y = state.height - h - 4.0;
-        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.45);
-        rounded_rect(ctx, x, y, w, h, 4.0);
-        ctx.fill().ok();
-        ctx.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-        ctx.move_to(x + pad, y + pad + extents.height());
-        ctx.show_text(&attribution).ok();
-    }
+    let attribution =
+        crate::lang::t_or(inner.attribution_key(), "\u{a9} OpenStreetMap contributors");
+    let layout = fonts.layout_text(&attribution, 10.0, Color::from_rgba8(255, 255, 255, 242), None);
+    let (lw, lh) = FontSystem::layout_size(&layout);
+    let (lw, lh) = (lw / fonts.scale, lh / fonts.scale);
+    let pad = 6.0;
+    let bw = lw + pad * 2.0;
+    let bh = lh + pad;
+    let bx = ox + w - bw - 4.0;
+    let by = oy + h - bh - 4.0;
+    let dpr = fonts.scale as f64;
+    let plate = RoundedRect::new(
+        bx as f64 * dpr,
+        by as f64 * dpr,
+        (bx + bw) as f64 * dpr,
+        (by + bh) as f64 * dpr,
+        4.0 * dpr,
+    );
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &Brush::Solid(Color::from_rgba8(0, 0, 0, 115)),
+        None,
+        &plate,
+    );
+    draw_layout(scene, &layout, bx + pad, by + pad / 2.0, fonts.scale);
 
     // Offline badge top-left.
-    if state.offline {
+    if inner.offline {
         let text = crate::lang::t_or("mapskit.map.offline", "Offline");
-        if let Ok(extents) = ctx.text_extents(&text) {
-            let pad = 6.0;
-            let w = extents.width() + pad * 2.0;
-            let h = extents.height() + pad;
-            ctx.set_source_rgba(0.55, 0.15, 0.05, 0.85);
-            rounded_rect(ctx, 6.0, 6.0, w, h, 4.0);
-            ctx.fill().ok();
-            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-            ctx.move_to(6.0 + pad, 6.0 + pad + extents.height());
-            ctx.show_text(&text).ok();
-        }
+        draw_pill(
+            scene,
+            fonts,
+            &text,
+            10.0,
+            ox + 6.0,
+            oy + 6.0,
+            Color::from_rgba8(140, 38, 13, 217),
+            Color::from_rgba8(255, 255, 255, 242),
+        );
     }
 }
 
 /// The pill button label: shows the layer the tap switches to.
-fn layer_toggle_label(state: &MapState) -> String {
-    if state.style == MapStyle::Satellite {
+fn layer_toggle_label(inner: &MapInner) -> String {
+    if inner.style == MapStyle::Satellite {
         crate::lang::t_or("mapskit.map.standard", "Standard")
     } else {
         crate::lang::t_or("mapskit.map.satellite", "Satellite")
     }
 }
 
-/// Draws the layer toggle pill at the bottom left.
-fn draw_layer_toggle(state: &MapState, ctx: &gtk::cairo::Context) {
-    ctx.select_font_face(
-        "SF Pro Text",
-        gtk::cairo::FontSlant::Normal,
-        gtk::cairo::FontWeight::Normal,
+/// Draws the layer toggle pill at the bottom left and returns its logical rect.
+fn draw_layer_toggle(
+    inner: &MapInner,
+    scene: &mut Scene,
+    fonts: &mut FontSystem,
+    ox: f32,
+    oy: f32,
+    h: f32,
+) -> Option<(f64, f64, f64, f64)> {
+    let label = layer_toggle_label(inner);
+    let layout = fonts.layout_text(
+        &label,
+        11.0,
+        match inner.style {
+            MapStyle::Dark | MapStyle::Satellite => Color::WHITE,
+            _ => Color::from_rgb8(0x27, 0x27, 0x27),
+        },
+        None,
     );
-    ctx.set_font_size(11.0);
+    let (lw, lh) = FontSystem::layout_size(&layout);
+    let (lw, lh) = (lw / fonts.scale, lh / fonts.scale);
 
-    let label = layer_toggle_label(state);
-    let Ok(extents) = ctx.text_extents(&label) else {
-        return;
+    const PAD_X: f32 = 12.0;
+    const PAD_Y: f32 = 7.0;
+    const MARGIN: f32 = 10.0;
+    let w = lw + PAD_X * 2.0;
+    let ph = lh + PAD_Y * 2.0;
+    let x = ox + MARGIN;
+    let y = oy + h - ph - MARGIN;
+    let dpr = fonts.scale as f64;
+
+    let fill_alpha: u8 = match inner.style {
+        MapStyle::Dark | MapStyle::Satellite => 31,
+        _ => 217,
     };
-
-    const PAD_X: f64 = 12.0;
-    const PAD_Y: f64 = 7.0;
-    const MARGIN: f64 = 10.0;
-    let w = extents.width() + PAD_X * 2.0;
-    let h = extents.height() + PAD_Y * 2.0;
-    let x = MARGIN;
-    let y = state.height - h - MARGIN;
-
-    // Frosted glass pill with hairline border.
-    let dark = matches!(state.style, MapStyle::Dark | MapStyle::Satellite);
-    let (fill, line, text) = if dark {
-        (0.12_f64, 1.0_f64, (1.0, 1.0, 1.0))
-    } else {
-        (0.85, 0.0, (0.12, 0.12, 0.13))
+    let plate = RoundedRect::new(
+        x as f64 * dpr,
+        y as f64 * dpr,
+        (x + w) as f64 * dpr,
+        (y + ph) as f64 * dpr,
+        (ph / 2.0) as f64 * dpr,
+    );
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &Brush::Solid(Color::from_rgba8(0, 0, 0, fill_alpha)),
+        None,
+        &plate,
+    );
+    let border = RoundedRect::new(
+        (x as f64 + 0.5) * dpr,
+        (y as f64 + 0.5) * dpr,
+        ((x + w) as f64 - 0.5) * dpr,
+        ((y + ph) as f64 - 0.5) * dpr,
+        (ph / 2.0) as f64 * dpr,
+    );
+    let line_color = match inner.style {
+        MapStyle::Dark | MapStyle::Satellite => Color::from_rgba8(255, 255, 255, 46),
+        _ => Color::from_rgba8(0, 0, 0, 46),
     };
-    ctx.set_source_rgba(0.0, 0.0, 0.0, fill);
-    rounded_rect(ctx, x, y, w, h, h / 2.0);
-    ctx.fill().ok();
-    ctx.set_source_rgba(line, line, line, 0.18);
-    rounded_rect(ctx, x + 0.5, y + 0.5, w - 1.0, h - 1.0, h / 2.0);
-    ctx.set_line_width(1.0);
-    ctx.stroke().ok();
+    scene.stroke(
+        &Stroke::new(1.0 * dpr),
+        Affine::IDENTITY,
+        &Brush::Solid(line_color),
+        None,
+        &border,
+    );
+    draw_layout(scene, &layout, x + PAD_X, y + PAD_Y, fonts.scale);
 
-    ctx.set_source_rgb(text.0, text.1, text.2);
-    ctx.move_to(x + PAD_X, y + PAD_Y + extents.height());
-    ctx.show_text(&label).ok();
-
-    // Publish the rect for hit testing.
-    state.toggle_rect.set(Some((x, y, w, h)));
+    Some((x as f64 - ox as f64, y as f64 - oy as f64, w as f64, ph as f64))
 }
 
 // ═══════════════════════════════════════════════════════════════
 // MapView
 // ═══════════════════════════════════════════════════════════════
 
-/// An interactive 2D map view.
+/// An interactive 2D map view for TontooUI.
+///
+/// Implements [`TontooView`], so it embeds into any stack. The view shares
+/// its state through an `Arc<Mutex<..>>` with tile worker threads; it is
+/// `Clone` (clones share the same map) and all state-changing methods take
+/// `&self`.
+///
+/// Host `App`s must forward `mouse_down` / `mouse_up` / `mouse_wheel` and
+/// `mouse_move` (as `set_hover`) for pan and zoom to work.
+#[derive(Clone)]
 pub struct MapView {
-    area: DrawingArea,
-    state: Rc<RefCell<MapState>>,
+    shared: Arc<Mutex<MapInner>>,
+    x: f32,
+    y: f32,
+    placed_w: f32,
+    placed_h: f32,
 }
 
 impl MapView {
     /// Creates a map view from the configuration.
     pub fn new(config: &MapsConfiguration) -> Self {
-        let chain = Arc::new(ProviderChain::with_config(config));
-        let state = Rc::new(RefCell::new(MapState {
-            config: config.clone(),
-            chain,
-            camera: MapCamera::default(),
-            style: config.style,
-            tiles: HashMap::new(),
-            pending: HashSet::new(),
-            annotations: Vec::new(),
-            overlays: Vec::new(),
-            dragging: None,
-            drag_moved: false,
-            last_drag_offset: None,
-            toggle_rect: std::cell::Cell::new(None),
-            toggle_active: false,
-            width: 400.0,
-            height: 300.0,
-            offline: false,
-            user_location: None,
-            on_annotation_tapped: None,
-            on_camera_changed: None,
-        }));
-
-        let area = DrawingArea::new();
-        area.set_hexpand(true);
-        area.set_vexpand(true);
-
-        let view = Self { area: area.clone(), state };
-
-        view.setup_render(&area);
-        view.setup_gestures(&area);
-        view.setup_resize(&area);
-
-        view
+        Self {
+            shared: Arc::new(Mutex::new(MapInner {
+                config: config.clone(),
+                chain: Arc::new(ProviderChain::with_config(config)),
+                camera: MapCamera::default(),
+                style: config.style,
+                tiles: HashMap::new(),
+                pending: HashSet::new(),
+                annotations: Vec::new(),
+                overlays: Vec::new(),
+                press: None,
+                last_hover: None,
+                drag_moved: false,
+                toggle_rect: None,
+                toggle_active: false,
+                width: 400.0,
+                height: 300.0,
+                offline: false,
+                user_location: None,
+                on_annotation_tapped: None,
+                on_camera_changed: None,
+            })),
+            x: 0.0,
+            y: 0.0,
+            placed_w: 400.0,
+            placed_h: 300.0,
+        }
     }
 
-    /// The underlying GTK widget for embedding.
-    pub fn widget(&self) -> &DrawingArea {
-        &self.area
+    /// Placed rect (x, y, width, height) in logical px.
+    pub fn rect(&self) -> (f32, f32, f32, f32) {
+        (self.x, self.y, self.placed_w, self.placed_h)
+    }
+
+    fn notify_camera_changed(&self) {
+        let (callback, camera) = match self.shared.lock() {
+            Ok(s) => (s.on_camera_changed.clone(), s.camera),
+            Err(_) => return,
+        };
+        if let Some(cb) = callback {
+            cb(&camera);
+        }
     }
 
     /// Switches the base layer to satellite imagery (or back to the
     /// configured base style). Cached tiles of the old layer are dropped.
     pub fn set_satellite(&self, enabled: bool) {
-        {
-            let mut s = self.state.borrow_mut();
-            let style = if enabled {
+        let style = {
+            let s = match self.shared.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if enabled {
                 MapStyle::Satellite
             } else {
                 s.config.style
-            };
+            }
+        };
+        if let Ok(mut s) = self.shared.lock() {
             s.set_base_style(style);
         }
-        self.area.queue_draw();
     }
 
     /// Whether satellite imagery is currently shown.
     pub fn is_satellite(&self) -> bool {
-        self.state.borrow().style == MapStyle::Satellite
-    }
-
-    fn setup_render(&self, area: &DrawingArea) {
-        let state = self.state.clone();
-        area.set_draw_func(move |_area, ctx, width, height| {
-            {
-                let mut s = state.borrow_mut();
-                s.width = f64::from(width);
-                s.height = f64::from(height);
-            }
-            request_visible_tiles(&state, _area);
-            let s = state.borrow();
-            render(&s, ctx);
-        });
-    }
-
-    fn setup_resize(&self, area: &DrawingArea) {
-        let state = self.state.clone();
-        area.connect_resize(move |_, width, height| {
-            let mut s = state.borrow_mut();
-            s.width = f64::from(width);
-            s.height = f64::from(height);
-        });
-    }
-
-    fn setup_gestures(&self, area: &DrawingArea) {
-        // Tap detection (annotation hits) via GestureClick.
-        let click = GestureClick::new();
-        click.set_button(0);
-        let state_click = self.state.clone();
-        let area_click = area.clone();
-        click.connect_pressed(move |_click, _n, x, y| {
-            let mut s = state_click.borrow_mut();
-            if s.toggle_hit(x, y) {
-                // Layer toggle press: switch immediately and swallow the
-                // sequence so no pan or annotation tap starts.
-                let next = if s.style == MapStyle::Satellite {
-                    s.config.style
-                } else {
-                    MapStyle::Satellite
-                };
-                s.set_base_style(next);
-                s.dragging = None;
-                s.drag_moved = false;
-                s.last_drag_offset = None;
-                s.toggle_active = true;
-                area_click.queue_draw();
-                return;
-            }
-            s.toggle_active = false;
-            s.dragging = Some((x, y));
-            s.drag_moved = false;
-            s.last_drag_offset = None;
-        });
-
-        let state_release = self.state.clone();
-        click.connect_released(move |_, _n, x, y| {
-            let mut s = state_release.borrow_mut();
-            let was_drag = s.drag_moved;
-            let from_toggle = s.toggle_active;
-            s.dragging = None;
-            s.drag_moved = false;
-            s.last_drag_offset = None;
-            s.toggle_active = false;
-            if from_toggle || was_drag {
-                return;
-            }
-            if let Some(index) = s.hit_annotation(x, y) {
-                let annotation = s.annotations[index].clone();
-                if let Some(cb) = &s.on_annotation_tapped {
-                    cb(&annotation);
-                }
-            }
-        });
-        area.add_controller(click);
-
-        // Drag to pan via GestureDrag.
-        let drag = GestureDrag::new();
-        drag.set_button(0);
-        let state_begin = self.state.clone();
-        drag.connect_drag_begin(move |_drag, x, y| {
-            let mut s = state_begin.borrow_mut();
-            if s.toggle_active {
-                return;
-            }
-            if s.dragging.is_none() {
-                s.dragging = Some((x, y));
-                s.drag_moved = false;
-                s.last_drag_offset = Some((0.0, 0.0));
-            }
-        });
-
-        let state_pan = self.state.clone();
-        let area_pan = area.clone();
-        drag.connect_drag_update(move |_drag, dx, dy| {
-            {
-                let mut s = state_pan.borrow_mut();
-                if s.toggle_active {
-                    return;
-                }
-                if s.dragging.is_some() || s.drag_moved {
-                    // GTK reports the cumulative offset from the drag start,
-                    // so only the delta since the last event is applied.
-                    let (last_dx, last_dy) = s.last_drag_offset.unwrap_or((0.0, 0.0));
-                    let step_x = dx - last_dx;
-                    let step_y = dy - last_dy;
-                    s.last_drag_offset = Some((dx, dy));
-                    if step_x == 0.0 && step_y == 0.0 {
-                        return;
-                    }
-                    // Dragging right moves content right (viewport west);
-                    // dragging down moves content down (viewport north).
-                    s.camera.pan_pixels(step_x, -step_y);
-                    s.drag_moved = true;
-                    if let Some(cb) = &s.on_camera_changed {
-                        cb(&s.camera);
-                    }
-                }
-            }
-            area_pan.queue_draw();
-        });
-
-        let state_end = self.state.clone();
-        drag.connect_drag_end(move |_drag, _x, _y| {
-            let mut s = state_end.borrow_mut();
-            s.dragging = None;
-            s.last_drag_offset = None;
-        });
-        area.add_controller(drag);
-
-        // Scroll to zoom.
-        let scroll = EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-        );
-        let state_scroll = self.state.clone();
-        let area_scroll = area.clone();
-        scroll.connect_scroll(move |_, _dx, dy| {
-            let delta = if dy < 0.0 { 1.0 } else { -1.0 };
-            {
-                let mut s = state_scroll.borrow_mut();
-                let (cx, cy) = (s.width / 2.0, s.height / 2.0);
-                s.zoom_around(cx, cy, delta);
-                if let Some(cb) = &s.on_camera_changed {
-                    cb(&s.camera);
-                }
-            }
-            area_scroll.queue_draw();
-            glib::Propagation::Proceed
-        });
-        area.add_controller(scroll);
-
-        // Double click to zoom in.
-        let dblclick = GestureClick::new();
-        dblclick.set_button(gtk::gdk::BUTTON_PRIMARY);
-        let state_dbl = self.state.clone();
-        let area_dbl = area.clone();
-        dblclick.connect_pressed(move |gesture, n, x, y| {
-            if n == 2 {
-                let mut s = state_dbl.borrow_mut();
-                s.zoom_around(x, y, 1.0);
-                if let Some(cb) = &s.on_camera_changed {
-                    cb(&s.camera);
-                }
-                area_dbl.queue_draw();
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-            }
-        });
-        area.add_controller(dblclick);
+        self.shared.lock().map(|s| s.style == MapStyle::Satellite).unwrap_or(false)
     }
 
     // ─── Camera ────────────────────────────────────────────
 
     /// The current camera.
     pub fn camera(&self) -> MapCamera {
-        self.state.borrow().camera
+        self.shared.lock().map(|s| s.camera).unwrap_or_default()
     }
 
-    /// Replaces the camera and redraws.
+    /// Replaces the camera and notifies the camera callback.
     pub fn set_camera(&self, camera: MapCamera) {
-        {
-            let mut s = self.state.borrow_mut();
+        if let Ok(mut s) = self.shared.lock() {
             s.camera = camera;
         }
         self.notify_camera_changed();
-        self.area.queue_draw();
     }
 
     /// Centers the map at a zoom level.
@@ -943,28 +914,32 @@ impl MapView {
 
     /// The currently visible region.
     pub fn region(&self) -> MapRegion {
-        let s = self.state.borrow();
-        s.camera.region(s.width, s.height)
+        match self.shared.lock() {
+            Ok(s) => s.camera.region(s.width, s.height),
+            Err(_) => MapCamera::default().region(400.0, 300.0),
+        }
     }
 
     /// Fits the view to a region.
     pub fn set_region(&self, region: MapRegion) {
-        let zoom = {
-            let s = self.state.borrow();
-            s.fitting_zoom(&region.bounding_box())
+        let zoom = match self.shared.lock() {
+            Ok(s) => s.fitting_zoom(&region.bounding_box()),
+            Err(_) => return,
         };
         self.set_camera(MapCamera::new(region.center, zoom));
     }
 
     /// Fits the viewport to a bounding box.
     pub fn fit_bounds(&self, bbox: crate::types::BoundingBox) {
-        let (center, zoom) = {
-            let s = self.state.borrow();
-            let center = Coordinate::new(
-                (bbox.north + bbox.south) / 2.0,
-                (bbox.east + bbox.west) / 2.0,
-            );
-            (center, s.fitting_zoom(&bbox))
+        let (center, zoom) = match self.shared.lock() {
+            Ok(s) => {
+                let center = Coordinate::new(
+                    (bbox.north + bbox.south) / 2.0,
+                    (bbox.east + bbox.west) / 2.0,
+                );
+                (center, s.fitting_zoom(&bbox))
+            }
+            Err(_) => return,
         };
         self.set_camera(MapCamera::new(center, zoom));
     }
@@ -973,8 +948,9 @@ impl MapView {
 
     /// Adds an annotation pin.
     pub fn add_annotation(&self, annotation: Annotation) {
-        self.state.borrow_mut().annotations.push(annotation);
-        self.area.queue_draw();
+        if let Ok(mut s) = self.shared.lock() {
+            s.annotations.push(annotation);
+        }
     }
 
     /// Adds an annotation built from a place.
@@ -984,53 +960,56 @@ impl MapView {
 
     /// Removes an annotation by id.
     pub fn remove_annotation(&self, id: &str) {
-        self.state
-            .borrow_mut()
-            .annotations
-            .retain(|a| a.id != id);
-        self.area.queue_draw();
+        if let Ok(mut s) = self.shared.lock() {
+            s.annotations.retain(|a| a.id != id);
+        }
     }
 
     /// Removes all annotations.
     pub fn clear_annotations(&self) {
-        self.state.borrow_mut().annotations.clear();
-        self.area.queue_draw();
+        if let Ok(mut s) = self.shared.lock() {
+            s.annotations.clear();
+        }
     }
 
     /// All annotations.
     pub fn annotations(&self) -> Vec<Annotation> {
-        self.state.borrow().annotations.clone()
+        self.shared.lock().map(|s| s.annotations.clone()).unwrap_or_default()
     }
 
     /// Centers on a place and drops a pin.
     pub fn show_place(&self, place: &crate::types::Place) {
         self.clear_annotations();
         self.add_place(place);
-        self.set_center(place.coordinate, self.camera().zoom.max(14.0));
+        let zoom = self.camera().zoom.max(14.0);
+        self.set_center(place.coordinate, zoom);
     }
 
     // ─── Overlays ──────────────────────────────────────────
 
     /// Adds an overlay (polyline, polygon or circle).
     pub fn add_overlay(&self, overlay: impl Into<Overlay>) {
-        self.state.borrow_mut().overlays.push(overlay.into());
-        self.area.queue_draw();
+        if let Ok(mut s) = self.shared.lock() {
+            s.overlays.push(overlay.into());
+        }
     }
 
     /// Removes an overlay by id.
     pub fn remove_overlay(&self, id: &str) {
-        self.state.borrow_mut().overlays.retain(|o| match o {
-            Overlay::Polyline(p) => p.id != id,
-            Overlay::Polygon(p) => p.id != id,
-            Overlay::Circle(c) => c.id != id,
-        });
-        self.area.queue_draw();
+        if let Ok(mut s) = self.shared.lock() {
+            s.overlays.retain(|o| match o {
+                Overlay::Polyline(p) => p.id != id,
+                Overlay::Polygon(p) => p.id != id,
+                Overlay::Circle(c) => c.id != id,
+            });
+        }
     }
 
     /// Removes all overlays.
     pub fn clear_overlays(&self) {
-        self.state.borrow_mut().overlays.clear();
-        self.area.queue_draw();
+        if let Ok(mut s) = self.shared.lock() {
+            s.overlays.clear();
+        }
     }
 
     /// Displays a route as an accent polyline and fits the viewport to it.
@@ -1051,14 +1030,12 @@ impl MapView {
     // ─── Style ─────────────────────────────────────────────
 
     /// Switches the base map style (also switches the tile provider).
+    /// Cached tiles of the old style are dropped.
     pub fn set_style(&self, style: MapStyle) {
-        {
-            let mut s = self.state.borrow_mut();
+        if let Ok(mut s) = self.shared.lock() {
             s.config.style = style;
-            s.tiles.clear();
-            s.pending.clear();
+            s.set_base_style(style);
         }
-        self.area.queue_draw();
     }
 
     // ─── User Location ─────────────────────────────────────
@@ -1069,77 +1046,251 @@ impl MapView {
     /// user dot appears and the camera centers on it. Errors are logged via
     /// `MAPSKIT_DEBUG` only.
     pub fn show_user_location(&self) {
-        let state = self.state.clone();
-        let area = self.area.clone();
-        let (sender, receiver) = async_channel::unbounded::<Result<Coordinate, String>>();
-
+        let shared = self.shared.clone();
         std::thread::spawn(move || {
             let result = corelocation::get_location()
                 .map(|loc| Coordinate::new(loc.coordinates.latitude, loc.coordinates.longitude))
                 .map_err(|e| e.to_string());
-            let _ = sender.send_blocking(result);
-        });
-
-        glib::spawn_future_local(async move {
-            while let Ok(result) = receiver.recv().await {
-                match result {
-                    Ok(coordinate) => {
-                        {
-                            let mut s = state.borrow_mut();
-                            s.user_location = Some(coordinate);
-                            let zoom = s.camera.zoom.max(13.0);
-                            s.camera = MapCamera::new(coordinate, zoom);
-                            if let Some(cb) = &s.on_camera_changed {
-                                cb(&s.camera);
+            match result {
+                Ok(coordinate) => {
+                    let callback = {
+                        match shared.lock() {
+                            Ok(mut s) => {
+                                s.user_location = Some(coordinate);
+                                let zoom = s.camera.zoom.max(13.0);
+                                s.camera = MapCamera::new(coordinate, zoom);
+                                s.on_camera_changed.clone().map(|cb| (cb, s.camera))
                             }
+                            Err(_) => None,
                         }
-                        area.queue_draw();
+                    };
+                    if let Some((cb, camera)) = callback {
+                        cb(&camera);
                     }
-                    Err(e) => log_debug(&format!("user location failed: {e}")),
                 }
+                Err(e) => log_debug(&format!("user location failed: {e}")),
             }
         });
     }
 
     /// The user location currently shown, if any.
     pub fn user_location(&self) -> Option<Coordinate> {
-        self.state.borrow().user_location
+        self.shared.lock().ok().and_then(|s| s.user_location)
     }
 
     /// Manually sets the shown user location (without querying CoreLocation).
     pub fn set_user_location(&self, coordinate: Coordinate) {
-        {
-            let mut s = self.state.borrow_mut();
+        if let Ok(mut s) = self.shared.lock() {
             s.user_location = Some(coordinate);
         }
-        self.area.queue_draw();
     }
 
     /// Hides the user location dot.
     pub fn hide_user_location(&self) {
-        {
-            let mut s = self.state.borrow_mut();
+        if let Ok(mut s) = self.shared.lock() {
             s.user_location = None;
         }
-        self.area.queue_draw();
     }
 
     // ─── Callbacks ─────────────────────────────────────────
 
     /// Sets the callback for annotation taps.
-    pub fn on_annotation_tapped(&self, callback: impl Fn(&Annotation) + 'static) {
-        self.state.borrow_mut().on_annotation_tapped = Some(Box::new(callback));
+    pub fn on_annotation_tapped(&self, callback: impl Fn(&Annotation) + Send + Sync + 'static) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.on_annotation_tapped = Some(Arc::new(callback));
+        }
     }
 
     /// Sets the callback fired after camera changes (pan/zoom).
-    pub fn on_camera_changed(&self, callback: impl Fn(&MapCamera) + 'static) {
-        self.state.borrow_mut().on_camera_changed = Some(Box::new(callback));
+    pub fn on_camera_changed(&self, callback: impl Fn(&MapCamera) + Send + Sync + 'static) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.on_camera_changed = Some(Arc::new(callback));
+        }
     }
 
-    fn notify_camera_changed(&self) {
-        let s = self.state.borrow();
-        if let Some(cb) = &s.on_camera_changed {
-            cb(&s.camera);
+    // ─── Pointer handling (called by the host App) ─────────
+
+    fn press_at(&mut self, x: f64, y: f64) {
+        let lx = x - self.x as f64;
+        let ly = y - self.y as f64;
+        if let Ok(mut s) = self.shared.lock() {
+            if s.toggle_hit(lx, ly) {
+                let next = if s.style == MapStyle::Satellite {
+                    s.config.style
+                } else {
+                    MapStyle::Satellite
+                };
+                s.set_base_style(next);
+                s.press = None;
+                s.drag_moved = false;
+                s.toggle_active = true;
+                return;
+            }
+            s.toggle_active = false;
+            s.press = Some((lx, ly));
+            s.last_hover = Some((lx, ly));
+            s.drag_moved = false;
         }
+    }
+
+    fn release_at(&mut self, x: f64, y: f64) {
+        let lx = x - self.x as f64;
+        let ly = y - self.y as f64;
+        let (tapped, callback, was_drag, from_toggle) = match self.shared.lock() {
+            Ok(mut s) => {
+                let was_drag = s.drag_moved;
+                let from_toggle = s.toggle_active;
+                s.press = None;
+                s.last_hover = None;
+                s.drag_moved = false;
+                s.toggle_active = false;
+                if from_toggle || was_drag {
+                    (None, None, true, from_toggle)
+                } else {
+                    let hit = s.hit_annotation(lx, ly).map(|i| s.annotations[i].clone());
+                    let cb = s.on_annotation_tapped.clone();
+                    (hit, cb, false, false)
+                }
+            }
+            Err(_) => (None, None, false, false),
+        };
+        let _ = (was_drag, from_toggle);
+        if let (Some(annotation), Some(cb)) = (tapped, callback) {
+            cb(&annotation);
+        }
+    }
+
+    fn hover_at(&mut self, x: f32, y: f32) {
+        let lx = x as f64 - self.x as f64;
+        let ly = y as f64 - self.y as f64;
+        let callback = {
+            match self.shared.lock() {
+                Ok(mut s) => {
+                    let prev = s.last_hover;
+                    s.last_hover = Some((lx, ly));
+                    if s.toggle_active || s.press.is_none() {
+                        None
+                    } else if let Some((px, py)) = prev {
+                        let (dx, dy) = (lx - px, ly - py);
+                        if dx == 0.0 && dy == 0.0 {
+                            None
+                        } else {
+                            // Dragging right moves content right (viewport
+                            // west); dragging down moves content down
+                            // (viewport north).
+                            s.camera.pan_pixels(dx, -dy);
+                            s.drag_moved = true;
+                            s.on_camera_changed.clone().map(|cb| (cb, s.camera))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some((cb, camera)) = callback {
+            cb(&camera);
+        }
+    }
+
+    fn wheel_at(&mut self, dx: f64, dy: f64) {
+        let _ = dx;
+        // TontooUI reports scroll deltas in logical px (right/down
+        // positive); one notch (~20 px) is one zoom level.
+        let delta = (-dy / 20.0).clamp(-3.0, 3.0);
+        if delta == 0.0 {
+            return;
+        }
+        let callback = {
+            match self.shared.lock() {
+                Ok(mut s) => {
+                    let (ax, ay) = s.last_hover.unwrap_or((s.width / 2.0, s.height / 2.0));
+                    s.zoom_around(ax, ay, delta);
+                    s.on_camera_changed.clone().map(|cb| (cb, s.camera))
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some((cb, camera)) = callback {
+            cb(&camera);
+        }
+    }
+}
+
+impl TontooView for MapView {
+    fn measure(&mut self, _fonts: &mut FontSystem) -> (f32, f32) {
+        (self.placed_w.max(200.0), self.placed_h.max(150.0))
+    }
+
+    fn place(&mut self, _fonts: &mut FontSystem, x: f32, y: f32, width: f32, height: f32) {
+        self.x = x;
+        self.y = y;
+        self.placed_w = width.max(1.0);
+        self.placed_h = height.max(1.0);
+        if let Ok(mut s) = self.shared.lock() {
+            s.width = self.placed_w as f64;
+            s.height = self.placed_h as f64;
+        }
+    }
+
+    fn draw(&mut self, scene: &mut Scene, fonts: &mut FontSystem, images: &mut ImageLoader<'_>) {
+        if self.placed_w <= 0.0 || self.placed_h <= 0.0 {
+            return;
+        }
+        request_visible_tiles(&self.shared);
+
+        let dpr = fonts.scale as f64;
+        let (ox, oy) = (self.x as f64, self.y as f64);
+
+        // Clip everything to the view rect.
+        let clip = vello::kurbo::Rect::new(
+            ox * dpr,
+            oy * dpr,
+            (ox + self.placed_w as f64) * dpr,
+            (oy + self.placed_h as f64) * dpr,
+        );
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+
+        let Ok(mut inner) = self.shared.lock() else {
+            scene.pop_layer();
+            return;
+        };
+        let bg = background_for_style(inner.style);
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(bg), None, &clip);
+
+        draw_tiles(&inner, scene, images, dpr, ox, oy);
+        draw_overlays(&inner, scene, dpr, ox, oy);
+        draw_user_location(&inner, scene, dpr, ox, oy);
+        draw_annotations(&inner, scene, fonts, dpr, ox, oy);
+        draw_badges(&inner, scene, fonts, self.x, self.y, self.placed_w, self.placed_h);
+        let toggle_rect = draw_layer_toggle(&inner, scene, fonts, self.x, self.y, self.placed_h);
+        inner.toggle_rect = toggle_rect;
+
+        scene.pop_layer();
+    }
+
+    fn mouse_down(&mut self, x: f64, y: f64) {
+        self.press_at(x, y);
+    }
+
+    fn mouse_up(&mut self, x: f64, y: f64) {
+        self.release_at(x, y);
+    }
+
+    fn set_hover(&mut self, x: f32, y: f32) {
+        self.hover_at(x, y);
+    }
+
+    fn mouse_wheel(&mut self, dx: f64, dy: f64) {
+        self.wheel_at(dx, dy);
+    }
+
+    fn flex(&self) -> f32 {
+        1.0
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
