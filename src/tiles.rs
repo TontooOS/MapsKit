@@ -169,24 +169,20 @@ pub fn fetch_tile(
     }
 
     let url = provider.tile_url(key.x, key.y, key.z);
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(user_agent)
-        .timeout(std::time::Duration::from_secs(timeout_seconds))
-        .build()
-        .map_err(|e| MapsError::Network(e.to_string()))?;
+    let client = crate::providers::http_client(user_agent, timeout_seconds);
 
-    let resp = client.get(url).send()?;
-    if !resp.status().is_success() {
+    let resp = client.get(&url).send()?;
+    if !resp.is_success() {
         return Err(MapsError::Tile(format!(
             "{} returned status {} for {}/{}/{}",
             provider.name(),
-            resp.status(),
+            resp.status,
             key.z,
             key.x,
             key.y
         )));
     }
-    let bytes = resp.bytes()?.to_vec();
+    let bytes = resp.bytes().to_vec();
 
     // Basic sanity check: PNG (OSM/CARTO) or JPEG (Esri satellite) magic.
     if !is_supported_image(&bytes) {

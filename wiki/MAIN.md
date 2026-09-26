@@ -84,7 +84,7 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Performance Notes
 
-- All provider calls are blocking (`reqwest::blocking`). Call them from
+- All provider calls are blocking (NetworkKit `networkkit::http`). Call them from
   worker threads; the views already do this internally for tiles, the earth
   texture and user location.
 - Tiles are cached on disk under `$XDG_CACHE_HOME/tontoos/mapskit/tiles/`
@@ -96,6 +96,9 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Changelog
 
+- 2026-09-26: HTTP transport moved to NetworkKit (`networkkit::http` with a
+  shared `HttpClient` session per provider, query building via the `url`
+  crate). The `reqwest` dependency is removed.
 - 2026-08-23: GlobeView detail LOD: zooming in now stitches sharper 4x4
   tile blocks (zoom 4-7) around the view center and blends them over the
   base texture; the camera can go closer (distance clamp `1.15..=6.0`) and

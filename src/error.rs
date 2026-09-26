@@ -39,9 +39,12 @@ impl fmt::Display for MapsError {
 
 impl std::error::Error for MapsError {}
 
-impl From<reqwest::Error> for MapsError {
-    fn from(e: reqwest::Error) -> Self {
-        MapsError::Network(e.to_string())
+impl From<networkkit::types::NetworkError> for MapsError {
+    fn from(e: networkkit::types::NetworkError) -> Self {
+        match e {
+            networkkit::types::NetworkError::ParseError(msg) => MapsError::Parse(msg),
+            other => MapsError::Network(other.to_string()),
+        }
     }
 }
 

@@ -6,7 +6,7 @@
 //! - Routing: OSRM demo server (`router.project-osrm.org`)
 //! - Tiles: `tile.openstreetmap.org` (standard cartography)
 
-use super::{http_client, MapProvider};
+use super::{get_with_query, http_client, response_json, MapProvider};
 use crate::config::MapStyle;
 use crate::error::MapsError;
 use crate::types::{
@@ -42,7 +42,7 @@ impl OsmProvider {
         }
     }
 
-    fn client(&self) -> reqwest::blocking::Client {
+    fn client(&self) -> networkkit::http::HttpClient {
         http_client(&self.user_agent, self.timeout_seconds)
     }
 }
@@ -64,11 +64,14 @@ impl MapProvider for OsmProvider {
     }
 
     fn is_available(&self) -> bool {
-        self.client()
-            .head(format!("{}/status", self.nominatim_url))
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        networkkit::http::HttpRequest::new(
+            networkkit::http::HttpMethod::Head,
+            &format!("{}/status", self.nominatim_url),
+        )
+        .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+        .send()
+        .map(|r| r.is_success())
+        .unwrap_or(false)
     }
 
     fn search(
@@ -78,37 +81,36 @@ impl MapProvider for OsmProvider {
         limit: usize,
     ) -> Result<Vec<Place>, MapsError> {
         let client = self.client();
-        let mut url = reqwest::Url::parse(&format!("{}/search", self.nominatim_url))
-            .map_err(|e| MapsError::InvalidQuery(e.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("q", query)
-            .append_pair("format", "jsonv2")
-            .append_pair("addressdetails", "1")
-            .append_pair("limit", &limit.clamp(1, 50).to_string());
+        let mut params = vec![
+            ("q", query.to_string()),
+            ("format", "jsonv2".to_string()),
+            ("addressdetails", "1".to_string()),
+            ("limit", limit.clamp(1, 50).to_string()),
+        ];
 
         // Bias results towards the reference area without hard-bounding.
         if let Some(center) = near {
             let d = 2.0;
-            url.query_pairs_mut().append_pair(
+            params.push((
                 "viewbox",
-                &format!(
+                format!(
                     "{:.4},{:.4},{:.4},{:.4}",
                     center.longitude - d,
                     center.latitude + d,
                     center.longitude + d,
                     center.latitude - d
                 ),
-            );
+            ));
         }
 
-        let resp = client.get(url).send()?;
-        if !resp.status().is_success() {
+        let resp = get_with_query(&client, &format!("{}/search", self.nominatim_url), &params)?;
+        if !resp.is_success() {
             return Err(MapsError::Provider(format!(
                 "Nominatim returned status {}",
-                resp.status()
+                resp.status
             )));
         }
-        let json: Value = resp.json()?;
+        let json: Value = response_json(resp)?;
 
         let mut places = Vec::new();
         if let Some(items) = json.as_array() {
@@ -154,24 +156,25 @@ impl MapProvider for OsmProvider {
 
     fn reverse_geocode(&self, coordinate: Coordinate) -> Result<Address, MapsError> {
         let client = self.client();
-        let resp = client
-            .get(format!("{}/reverse", self.nominatim_url))
-            .query(&[
+        let resp = get_with_query(
+            &client,
+            &format!("{}/reverse", self.nominatim_url),
+            &[
                 ("lat", coordinate.latitude.to_string()),
                 ("lon", coordinate.longitude.to_string()),
                 ("format", "jsonv2".into()),
                 ("addressdetails", "1".into()),
                 ("zoom", "18".into()),
-            ])
-            .send()?;
+            ],
+        )?;
 
-        if !resp.status().is_success() {
+        if !resp.is_success() {
             return Err(MapsError::Provider(format!(
                 "Nominatim returned status {}",
-                resp.status()
+                resp.status
             )));
         }
-        let json: Value = resp.json()?;
+        let json: Value = response_json(resp)?;
         if json["error"].is_object() || json["error"].is_string() {
             return Err(MapsError::Provider(
                 json["error"].as_str().unwrap_or("reverse geocoding failed").into(),
@@ -190,23 +193,24 @@ impl MapProvider for OsmProvider {
         }
 
         let client = self.client();
-        let resp = client
-            .get(format!("{}/lookup", self.nominatim_url))
-            .query(&[
+        let resp = get_with_query(
+            &client,
+            &format!("{}/lookup", self.nominatim_url),
+            &[
                 ("osm_ids", osm_ref.to_string()),
                 ("format", "jsonv2".into()),
                 ("addressdetails", "1".into()),
                 ("extratags", "1".into()),
-            ])
-            .send()?;
+            ],
+        )?;
 
-        if !resp.status().is_success() {
+        if !resp.is_success() {
             return Err(MapsError::Provider(format!(
                 "Nominatim returned status {}",
-                resp.status()
+                resp.status
             )));
         }
-        let json: Value = resp.json()?;
+        let json: Value = response_json(resp)?;
         let item = json.as_array().and_then(|a| a.first()).cloned();
         let Some(item) = item else {
             return Ok(place.clone());
@@ -273,16 +277,16 @@ impl MapProvider for OsmProvider {
         let resp = client
             .post(&self.overpass_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!("data={}", urlencode(&body)))
+            .body_str(&format!("data={}", urlencode(&body)))
             .send()?;
 
-        if !resp.status().is_success() {
+        if !resp.is_success() {
             return Err(MapsError::Provider(format!(
                 "Overpass returned status {}",
-                resp.status()
+                resp.status
             )));
         }
-        let json: Value = resp.json()?;
+        let json: Value = response_json(resp)?;
 
         let mut places = Vec::new();
         if let Some(elements) = json["elements"].as_array() {
@@ -398,7 +402,7 @@ impl MapProvider for OsmProvider {
 
 /// Shared OSRM route fetching used by both providers.
 pub(crate) fn fetch_osrm_route(
-    client: &reqwest::blocking::Client,
+    client: &networkkit::http::HttpClient,
     base_url: &str,
     profile: &str,
     from: Coordinate,
@@ -413,14 +417,14 @@ pub(crate) fn fetch_osrm_route(
         "{base_url}/route/v1/{profile}/{coords}?overview=full&geometries=geojson&steps=true"
     );
 
-    let resp = client.get(url).send()?;
-    if !resp.status().is_success() {
+    let resp = client.get(&url).send()?;
+    if !resp.is_success() {
         return Err(MapsError::Provider(format!(
             "OSRM returned status {}",
-            resp.status()
+            resp.status
         )));
     }
-    let json: Value = resp.json()?;
+    let json: Value = response_json(resp)?;
 
     if json["code"].as_str() != Some("Ok") {
         return Err(MapsError::Provider(format!(

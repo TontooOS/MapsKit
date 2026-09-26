@@ -7,7 +7,7 @@
 //!   Dark Matter (dark)
 
 use super::osm::fetch_osrm_route;
-use super::{http_client, MapProvider};
+use super::{get_with_query, http_client, response_json, MapProvider};
 use crate::config::{MapStyle, MapsConfiguration};
 use crate::error::MapsError;
 use crate::types::{
@@ -44,7 +44,7 @@ impl PhotonProvider {
         }
     }
 
-    fn client(&self) -> reqwest::blocking::Client {
+    fn client(&self) -> networkkit::http::HttpClient {
         http_client(&self.user_agent, self.timeout_seconds)
     }
 
@@ -61,17 +61,14 @@ impl PhotonProvider {
 
     fn query(&self, params: &[(&str, String)]) -> Result<Value, MapsError> {
         let client = self.client();
-        let resp = client
-            .get(format!("{}/api/", self.photon_url))
-            .query(params)
-            .send()?;
-        if !resp.status().is_success() {
+        let resp = get_with_query(&client, &format!("{}/api/", self.photon_url), params)?;
+        if !resp.is_success() {
             return Err(MapsError::Provider(format!(
                 "Photon returned status {}",
-                resp.status()
+                resp.status
             )));
         }
-        resp.json().map_err(MapsError::from)
+        response_json(resp)
     }
 
     fn features_to_places(
@@ -179,11 +176,14 @@ impl MapProvider for PhotonProvider {
     }
 
     fn is_available(&self) -> bool {
-        self.client()
-            .head(&self.photon_url)
-            .send()
-            .map(|r| r.status().as_u16() < 500)
-            .unwrap_or(false)
+        networkkit::http::HttpRequest::new(
+            networkkit::http::HttpMethod::Head,
+            &self.photon_url,
+        )
+        .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+        .send()
+        .map(|r| r.status < 500)
+        .unwrap_or(false)
     }
 
     fn search(
@@ -207,21 +207,22 @@ impl MapProvider for PhotonProvider {
 
     fn reverse_geocode(&self, coordinate: Coordinate) -> Result<Address, MapsError> {
         let client = self.client();
-        let resp = client
-            .get(format!("{}/reverse", self.photon_url))
-            .query(&[
+        let resp = get_with_query(
+            &client,
+            &format!("{}/reverse", self.photon_url),
+            &[
                 ("lat", coordinate.latitude.to_string()),
                 ("lon", coordinate.longitude.to_string()),
                 ("lang", photon_lang()),
-            ])
-            .send()?;
-        if !resp.status().is_success() {
+            ],
+        )?;
+        if !resp.is_success() {
             return Err(MapsError::Provider(format!(
                 "Photon returned status {}",
-                resp.status()
+                resp.status
             )));
         }
-        let json: Value = resp.json()?;
+        let json: Value = response_json(resp)?;
         let feature = json["features"]
             .as_array()
             .and_then(|f| f.first())

@@ -213,13 +213,34 @@ impl Default for ProviderChain {
     }
 }
 
-/// Shared HTTP client construction for all providers.
-pub(crate) fn http_client(user_agent: &str, timeout_seconds: u64) -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .user_agent(user_agent)
+/// Shared HTTP session construction for all providers.
+pub(crate) fn http_client(
+    user_agent: &str,
+    timeout_seconds: u64,
+) -> networkkit::http::HttpClient {
+    networkkit::http::HttpClient::with_user_agent(user_agent)
         .timeout(std::time::Duration::from_secs(timeout_seconds))
-        .build()
-        .expect("failed to build HTTP client")
+}
+
+/// Blocking GET with URL-encoded query pairs.
+pub(crate) fn get_with_query(
+    client: &networkkit::http::HttpClient,
+    base: &str,
+    params: &[(&str, String)],
+) -> Result<networkkit::http::HttpResponse, MapsError> {
+    let mut url =
+        url::Url::parse(base).map_err(|e| MapsError::InvalidQuery(e.to_string()))?;
+    for (key, value) in params {
+        url.query_pairs_mut().append_pair(key, value);
+    }
+    client.get(url.as_str()).send().map_err(MapsError::from)
+}
+
+/// Parses a response body as JSON.
+pub(crate) fn response_json(
+    resp: networkkit::http::HttpResponse,
+) -> Result<serde_json::Value, MapsError> {
+    resp.json().map_err(MapsError::from)
 }
 
 #[cfg(test)]

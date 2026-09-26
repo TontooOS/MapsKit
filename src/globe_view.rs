@@ -1062,11 +1062,10 @@ fn stitch_region(
     let size = GRID * TILE_PX as u32;
 
     let provider = chain.tile_provider_for(config.style).cloned()?;
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(config.user_agent.clone())
-        .timeout(std::time::Duration::from_secs(config.timeout_seconds.max(10)))
-        .build()
-        .ok()?;
+    let client = crate::providers::http_client(
+        &config.user_agent,
+        config.timeout_seconds.max(10),
+    );
 
     let (fx, fy) = crate::tiles::tile_for(center, zoom);
     let ([west, east, north_my, south_my], x0, y0) = region_bounds(zoom, GRID, fx, fy);
@@ -1083,10 +1082,10 @@ fn stitch_region(
         for gx in 0..GRID {
             let url = provider.tile_url(x0 + gx, y0 + gy, zoom);
             let resp = client.get(&url).send().ok()?;
-            if !resp.status().is_success() {
+            if !resp.is_success() {
                 return None;
             }
-            let bytes = resp.bytes().ok()?;
+            let bytes = resp.bytes().to_vec();
             let loader = gdk_pixbuf::PixbufLoader::new();
             loader.write(&bytes).ok()?;
             loader.close().ok()?;
