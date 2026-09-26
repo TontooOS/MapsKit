@@ -1,19 +1,20 @@
 //! Interactive TontooMapsKit demo (TontooUI).
 //!
-//! A map with a search field, a route button and a user location button.
-//! Search and routing run on worker threads so the UI stays responsive;
-//! results write straight into the shared map model.
+//! A map with a floating glass toolbar: a search field plus locate/route
+//! actions hovering directly over the map. Search and routing run on
+//! worker threads so the UI stays responsive; results write straight into
+//! the shared map model.
 //!
 //! Run with: `cargo run --example maps_demo`
 //!
 //! Controls: click the map and drag to pan, scroll to zoom, click the
 //! Satellite/Standard pill to switch layers. Type a query and press Enter
-//! to search from your location (nearest first), then press Route for
-//! driving directions from your location to the nearest result.
+//! to search from your location (nearest first), then the route action
+//! for driving directions to the nearest result.
 
 use mapskit::prelude::*;
 use std::sync::{Arc, Mutex};
-use tontooui::elements::{Button, SearchField, Titlebar, TrafficAction, View};
+use tontooui::elements::{BasicToolbar, SearchField, Titlebar, ToolbarItem, TrafficAction, View};
 use tontooui::renderer::FontSystem;
 use tontooui::renderer::ImageLoader;
 use tontooui::renderer::window::{App, Viewport, WindowCommand, run};
@@ -21,7 +22,7 @@ use tontooui::theme::{ThemeMode, ThemeWatcher};
 use vello::Scene;
 use vello::peniko::Color;
 
-/// Latest search results, shared with the button callbacks.
+/// Latest search results, shared with the toolbar callback.
 type SharedResults = Arc<Mutex<Vec<Place>>>;
 
 /// Origin for search and routing: the known user dot, else a fresh
@@ -55,13 +56,51 @@ fn sort_by_distance(places: &mut Vec<Place>, origin: Coordinate) {
     });
 }
 
+/// Routes from the user location to the nearest of `places` and displays
+/// the result on `map`. Blocking — call from a worker thread.
+fn route_to_nearest(map: &MapView, places: &[Place]) {
+    if places.is_empty() {
+        println!("[maps_demo] search for a place first (type + Enter)");
+        return;
+    }
+    let (origin, from_center) = locate_origin(map);
+    let Some(dest) = places.iter().min_by(|a, b| {
+        let da = a.coordinate.distance_to(&origin);
+        let db = b.coordinate.distance_to(&origin);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return;
+    };
+    if from_center {
+        println!("[maps_demo] no location available, routing from map center");
+    }
+    println!("[maps_demo] routing to nearest result: {}", dest.name);
+    match ProviderChain::default_providers().route(origin, dest.coordinate, TravelMode::Driving) {
+        Ok(route) => {
+            println!(
+                "[maps_demo] route {} / {} via {}",
+                route.distance_text(),
+                route.duration_text(),
+                route.source
+            );
+            for step in route.steps.iter().take(5) {
+                println!("   - {}", step.instruction);
+            }
+            map.display_route(&route);
+        }
+        Err(e) => eprintln!("[maps_demo] route failed: {e}"),
+    }
+}
+
 struct MapsDemo {
     bar: Titlebar,
     search: SearchField,
-    route_button: Button,
-    locate_button: Button,
+    toolbar: BasicToolbar,
     map: MapView,
     results: SharedResults,
+    /// Floating overlay rect (search + toolbar) for hit-testing, so presses
+    /// on the glass never start a map drag.
+    overlay: (f32, f32, f32, f32),
     watcher: ThemeWatcher,
     focused: bool,
     bg: Color,
@@ -85,71 +124,39 @@ impl MapsDemo {
             "Search places and addresses",
         ));
 
-        // Route: from your location to the nearest search result. The
-        // cloned map and results share their models, so the worker thread
-        // updates the UI directly and the shell picks it up on the next
-        // frame.
-        let route_map = map.clone();
-        let route_results: SharedResults = Arc::new(Mutex::new(Vec::new()));
-        let route_button = Button::new("Route").on_press({
-            let map = route_map.clone();
-            let results = route_results.clone();
-            move || {
-                let map = map.clone();
-                let results = results.clone();
-                std::thread::spawn(move || {
-                    let places = results.lock().map(|r| r.clone()).unwrap_or_default();
-                    if places.is_empty() {
-                        println!("[maps_demo] search for a place first (type + Enter)");
-                        return;
-                    }
-                    // Origin: user location first, so "Aldi" means the Aldi
-                    // near you, not near the map center.
-                    let (origin, from_center) = locate_origin(&map);
-                    let Some(dest) = places.iter().min_by(|a, b| {
-                        let da = a.coordinate.distance_to(&origin);
-                        let db = b.coordinate.distance_to(&origin);
-                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                    }) else {
-                        return;
-                    };
-                    if from_center {
-                        println!("[maps_demo] no location available, routing from map center");
-                    }
-                    println!("[maps_demo] routing to nearest result: {}", dest.name);
-                    match ProviderChain::default_providers()
-                        .route(origin, dest.coordinate, TravelMode::Driving)
-                    {
-                        Ok(route) => {
-                            println!(
-                                "[maps_demo] route {} / {} via {}",
-                                route.distance_text(),
-                                route.duration_text(),
-                                route.source
-                            );
-                            for step in route.steps.iter().take(5) {
-                                println!("   - {}", step.instruction);
-                            }
-                            map.display_route(&route);
-                        }
-                        Err(e) => eprintln!("[maps_demo] route failed: {e}"),
-                    }
-                });
+        // Floating glass toolbar: locate + route. The cloned map and
+        // results share their models, so the worker thread updates the UI
+        // directly and the shell picks it up on the next frame.
+        let action_map = map.clone();
+        let action_results: SharedResults = Arc::new(Mutex::new(Vec::new()));
+        let toolbar = BasicToolbar::from_items(vec![
+            ToolbarItem::icon("location.fill"),
+            ToolbarItem::icon("arrow.turn.up.right"),
+        ])
+        .on_action({
+            let map = action_map.clone();
+            let results = action_results.clone();
+            move |index| match index {
+                0 => map.show_user_location(),
+                1 => {
+                    let map = map.clone();
+                    let results = results.clone();
+                    std::thread::spawn(move || {
+                        let places = results.lock().map(|r| r.clone()).unwrap_or_default();
+                        route_to_nearest(&map, &places);
+                    });
+                }
+                _ => {}
             }
-        });
-
-        let locate_map = map.clone();
-        let locate_button = Button::new("Locate").on_press(move || {
-            locate_map.show_user_location();
         });
 
         Self {
             bar: Titlebar::new("TontooMapsKit"),
             search,
-            route_button,
-            locate_button,
+            toolbar,
             map,
-            results: route_results,
+            results: action_results,
+            overlay: (0.0, 0.0, 0.0, 0.0),
             watcher: ThemeWatcher::new(),
             focused: true,
             bg: tontooui::renderer::window::BACKGROUND,
@@ -186,9 +193,8 @@ impl MapsDemo {
                     }
                     sort_by_distance(&mut places, origin);
                     for place in &places {
-                        let dist = mapskit::format_distance(
-                            place.coordinate.distance_to(&origin),
-                        );
+                        let dist =
+                            mapskit::format_distance(place.coordinate.distance_to(&origin));
                         println!("  {} - {} ({})", place.name, place.address.one_line(), dist);
                     }
                     // Remember the results so Route can pick the nearest one.
@@ -206,6 +212,11 @@ impl MapsDemo {
             }
         });
     }
+
+    fn overlay_hit(&self, x: f64, y: f64) -> bool {
+        let (ox, oy, ow, oh) = self.overlay;
+        x >= ox as f64 && x <= (ox + ow) as f64 && y >= oy as f64 && y <= (oy + oh) as f64
+    }
 }
 
 impl App for MapsDemo {
@@ -221,7 +232,13 @@ impl App for MapsDemo {
         self.watcher.set_focused(self.focused, time_secs);
         let palette = self.watcher.palette(time_secs);
         self.bg = palette.bg;
-        let dark = self.watcher.theme().mode == ThemeMode::Dark;
+        let theme = self.watcher.theme();
+        let dark = theme.mode == ThemeMode::Dark;
+
+        self.search.set_theme(theme.mode, palette.accent, theme.glass);
+        self.search.set_focused(self.focused);
+        self.toolbar.set_theme(theme.mode, theme.glass);
+        self.toolbar.set_focused(self.focused);
 
         self.bar.set_palette(
             palette.titlebar_bg,
@@ -231,39 +248,43 @@ impl App for MapsDemo {
         self.bar.set_rect(viewport.x, viewport.y, viewport.width);
         self.bar.draw(scene, fonts);
 
+        // The map fills the whole content area; the search + toolbar float
+        // over it as glass.
         let top = viewport.y + 31.0;
         let pad = 12.0;
-        let row_h = 36.0;
-        let btn_w = 90.0;
-        let gap = 8.0;
-        let content_w = viewport.width - pad * 2.0;
-        let search_w = (content_w - btn_w * 2.0 - gap * 2.0).max(120.0);
-        let x0 = viewport.x + pad;
-
-        self.search.place(fonts, x0, top + pad, search_w, row_h);
-        self.route_button.place(fonts, x0 + search_w + gap, top + pad, btn_w, row_h);
-        self.locate_button.place(
+        self.map.place(
             fonts,
-            x0 + search_w + gap + btn_w + gap,
-            top + pad,
-            btn_w,
-            row_h,
+            viewport.x,
+            top,
+            viewport.width,
+            (viewport.y + viewport.height - top).max(100.0),
         );
-
-        let map_y = top + pad + row_h + pad;
-        let map_h = (viewport.y + viewport.height - map_y - pad).max(100.0);
-        self.map.place(fonts, x0, map_y, content_w, map_h);
-
-        self.search.draw(scene, fonts, images);
-        self.route_button.draw(scene, fonts, images);
-        self.locate_button.draw(scene, fonts, images);
         self.map.draw(scene, fonts, images);
 
+        let gap = 8.0;
+        let row_y = top + pad;
+        let (bar_w, bar_h) = self.toolbar.measure(fonts);
+        let bar_x = viewport.x + viewport.width - pad - bar_w;
+        let content_w = (bar_x - gap - (viewport.x + pad)).max(120.0);
+        self.search.place(fonts, viewport.x + pad, row_y, content_w, 36.0);
+        self.toolbar.place(fonts, bar_x, row_y, bar_w, bar_h);
+
+        self.search.draw(scene, fonts, images);
+        self.toolbar.draw(scene, fonts, images);
+
+        let (_, _, _, sh) = self.search.rect();
+        let overlay_h = sh.max(bar_h) + 16.0;
+        self.overlay = (viewport.x, row_y - 8.0, viewport.width, overlay_h);
         let _ = dark;
     }
 
     fn background(&self) -> Color {
         self.bg
+    }
+
+    /// Glass blur pass so the floating toolbar refracts the map.
+    fn wants_backdrop(&self) -> bool {
+        true
     }
 
     fn drag_region(&self) -> Option<(f32, f32, f32, f32)> {
@@ -283,15 +304,16 @@ impl App for MapsDemo {
             None => {}
         }
         self.search.mouse_down(x, y);
-        self.route_button.mouse_down(x, y);
-        self.locate_button.mouse_down(x, y);
-        self.map.mouse_down(x, y);
+        self.toolbar.mouse_down(x, y);
+        // Presses on the floating glass must not start a map drag.
+        if !self.overlay_hit(x, y) {
+            self.map.mouse_down(x, y);
+        }
     }
 
     fn mouse_up(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
-        self.route_button.mouse_up(x, y);
-        self.locate_button.mouse_up(x, y);
+        self.toolbar.mouse_up(x, y);
         self.map.mouse_up(x, y);
     }
 
@@ -299,8 +321,7 @@ impl App for MapsDemo {
         self.cursor = (x, y);
         self.bar.set_hover(x as f32, y as f32);
         self.search.set_hover(x as f32, y as f32);
-        self.route_button.set_hover(x as f32, y as f32);
-        self.locate_button.set_hover(x as f32, y as f32);
+        self.toolbar.set_hover(x as f32, y as f32);
         self.map.set_hover(x as f32, y as f32);
     }
 
