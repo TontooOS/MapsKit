@@ -131,6 +131,10 @@ map.hide_user_location();
 
 CoreLocation failures are only logged when `MAPSKIT_DEBUG=1`.
 
+The last fix is cached for 60 s: while fresh, `show_user_location`
+centers immediately without querying the daemon again. `set_user_location`
+refreshes the cache as well.
+
 ## Tile Loading Behavior
 
 - Visible tiles are requested during the draw pass; missing ones are queued

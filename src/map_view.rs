@@ -102,6 +102,10 @@ struct MapInner {
     offline: bool,
     /// The user's location, when shown via `show_user_location`.
     user_location: Option<Coordinate>,
+    /// Last CoreLocation fix with its timestamp. Reused by
+    /// `show_user_location` while fresh so repeated presses do not
+    /// re-query the daemon every time.
+    location_cache: Option<(Coordinate, Instant)>,
     on_annotation_tapped: Option<AnnotationCallback>,
     on_camera_changed: Option<CameraCallback>,
 }
@@ -244,6 +248,9 @@ impl MapInner {
 /// bursts (HTTP 429), so fetches go through a small shared worker pool
 /// instead of one thread per tile.
 const TILE_WORKERS: usize = 6;
+/// How long a CoreLocation fix is reused before `show_user_location`
+/// queries again.
+const LOCATION_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Failed tiles are retried after this cooldown instead of staying blank
 /// forever.
 const TILE_RETRY_AFTER: Duration = Duration::from_secs(8);
@@ -940,6 +947,7 @@ impl MapView {
                 height: 300.0,
                 offline: false,
                 user_location: None,
+                location_cache: None,
                 on_annotation_tapped: None,
                 on_camera_changed: None,
             })),
@@ -1139,10 +1147,37 @@ impl MapView {
 
     /// Shows the user location using CoreLocation and centers on it.
     ///
-    /// CoreLocation is queried on a worker thread; when it answers, the blue
-    /// user dot appears and the camera centers on it. Errors are logged via
-    /// `MAPSKIT_DEBUG` only.
+    /// The last fix is cached for [`LOCATION_CACHE_TTL`]: while fresh, the
+    /// dot appears and the camera centers immediately without querying
+    /// again. Otherwise CoreLocation is queried on a worker thread; when
+    /// it answers, the blue user dot appears, the camera centers on it and
+    /// the fix is cached. Errors are logged via `MAPSKIT_DEBUG` only.
     pub fn show_user_location(&self) {
+        // Fast path: reuse a fresh cached fix.
+        let cached = {
+            match self.shared.lock() {
+                Ok(mut s) => {
+                    if let Some((coordinate, at)) = s.location_cache {
+                        if at.elapsed() < LOCATION_CACHE_TTL {
+                            s.user_location = Some(coordinate);
+                            let zoom = s.camera.zoom.max(13.0);
+                            s.camera = MapCamera::new(coordinate, zoom);
+                            s.on_camera_changed.clone().map(|cb| (cb, s.camera))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some((cb, camera)) = cached {
+            cb(&camera);
+            return;
+        }
+
         let shared = self.shared.clone();
         std::thread::spawn(move || {
             let result = corelocation::get_location()
@@ -1154,6 +1189,7 @@ impl MapView {
                         match shared.lock() {
                             Ok(mut s) => {
                                 s.user_location = Some(coordinate);
+                                s.location_cache = Some((coordinate, Instant::now()));
                                 let zoom = s.camera.zoom.max(13.0);
                                 s.camera = MapCamera::new(coordinate, zoom);
                                 s.on_camera_changed.clone().map(|cb| (cb, s.camera))
@@ -1176,9 +1212,12 @@ impl MapView {
     }
 
     /// Manually sets the shown user location (without querying CoreLocation).
+    /// Also refreshes the location cache, so a following
+    /// `show_user_location` reuses it while fresh.
     pub fn set_user_location(&self, coordinate: Coordinate) {
         if let Ok(mut s) = self.shared.lock() {
             s.user_location = Some(coordinate);
+            s.location_cache = Some((coordinate, Instant::now()));
         }
     }
 
@@ -1389,5 +1428,46 @@ impl TontooView for MapView {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_location_centers_immediately() {
+        // A fresh manually set location must be reused synchronously, with
+        // no CoreLocation daemon involved.
+        let map = MapView::new(&MapsConfiguration::new());
+        let berlin = Coordinate::new(52.52, 13.405);
+        map.set_user_location(berlin);
+        map.set_center(Coordinate::new(48.137, 11.575), 10.0);
+        map.show_user_location();
+        let camera = map.camera();
+        assert!((camera.center.latitude - berlin.latitude).abs() < 1e-9);
+        assert!((camera.center.longitude - berlin.longitude).abs() < 1e-9);
+        assert!(camera.zoom >= 13.0);
+        assert_eq!(map.user_location(), Some(berlin));
+    }
+
+    #[test]
+    fn stale_cache_queries_again() {
+        // An expired cache entry must not be reused: with no daemon
+        // reachable the camera stays where it is.
+        let map = MapView::new(&MapsConfiguration::new());
+        {
+            let mut s = map.shared.lock().unwrap();
+            s.location_cache = Some((
+                Coordinate::new(52.52, 13.405),
+                Instant::now() - LOCATION_CACHE_TTL - Duration::from_secs(1),
+            ));
+        }
+        map.set_center(Coordinate::new(48.137, 11.575), 10.0);
+        map.show_user_location();
+        // Give the worker thread no chance: the fast path would have
+        // centered synchronously.
+        let camera = map.camera();
+        assert!((camera.center.latitude - 48.137).abs() < 1e-9);
     }
 }

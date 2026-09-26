@@ -92,6 +92,8 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Changelog
 
+- 2026-09-26: Location caching: `show_user_location` reuses the last fix
+  for 60 s instead of querying CoreLocation on every press.
 - 2026-09-26: Light tiles now come from `tile.openstreetmap.org` (the same
   Fastly CDN tiles Leaflet shows: fast, no key) instead of slow Wikimedia
   `osm-intl`; center tiles download first. The fallback provider serves

@@ -1,16 +1,18 @@
 //! Interactive TontooMapsKit demo (TontooUI).
 //!
-//! A map with a search field, a route demo button and a user location
-//! button. Search and routing run on worker threads so the UI stays
-//! responsive; results write straight into the shared map model.
+//! A map with a search field, a route button and a user location button.
+//! Search and routing run on worker threads so the UI stays responsive;
+//! results write straight into the shared map model.
 //!
 //! Run with: `cargo run --example maps_demo`
 //!
 //! Controls: click the map and drag to pan, scroll to zoom, click the
 //! Satellite/Standard pill to switch layers. Type a query and press Enter
-//! to search.
+//! to search, then press Route for driving directions from your location
+//! to the nearest result.
 
 use mapskit::prelude::*;
+use std::sync::{Arc, Mutex};
 use tontooui::elements::{Button, SearchField, Titlebar, TrafficAction, View};
 use tontooui::renderer::FontSystem;
 use tontooui::renderer::ImageLoader;
@@ -19,12 +21,16 @@ use tontooui::theme::{ThemeMode, ThemeWatcher};
 use vello::Scene;
 use vello::peniko::Color;
 
+/// Latest search results, shared with the button callbacks.
+type SharedResults = Arc<Mutex<Vec<Place>>>;
+
 struct MapsDemo {
     bar: Titlebar,
     search: SearchField,
     route_button: Button,
     locate_button: Button,
     map: MapView,
+    results: SharedResults,
     watcher: ThemeWatcher,
     focused: bool,
     bg: Color,
@@ -48,31 +54,72 @@ impl MapsDemo {
             "Search places and addresses",
         ));
 
-        // Route demo: Brandenburg Gate -> Alexanderplatz. The cloned map
-        // shares the same model, so the worker thread updates the UI
-        // directly and the shell picks it up on the next frame.
+        // Route: from your location to the nearest search result. The
+        // cloned map and results share their models, so the worker thread
+        // updates the UI directly and the shell picks it up on the next
+        // frame.
         let route_map = map.clone();
-        let route_button = Button::new("Route").on_press(move || {
+        let route_results: SharedResults = Arc::new(Mutex::new(Vec::new()));
+        let route_button = Button::new("Route").on_press({
             let map = route_map.clone();
-            std::thread::spawn(move || {
-                let from = Coordinate::new(52.5163, 13.3777);
-                let to = Coordinate::new(52.5219, 13.4132);
-                match ProviderChain::default_providers().route(from, to, TravelMode::Driving) {
-                    Ok(route) => {
-                        println!(
-                            "[maps_demo] route {} / {} via {}",
-                            route.distance_text(),
-                            route.duration_text(),
-                            route.source
-                        );
-                        for step in route.steps.iter().take(5) {
-                            println!("   - {}", step.instruction);
-                        }
-                        map.display_route(&route);
+            let results = route_results.clone();
+            move || {
+                let map = map.clone();
+                let results = results.clone();
+                std::thread::spawn(move || {
+                    let places = results.lock().map(|r| r.clone()).unwrap_or_default();
+                    if places.is_empty() {
+                        println!("[maps_demo] search for a place first (type + Enter)");
+                        return;
                     }
-                    Err(e) => eprintln!("[maps_demo] route failed: {e}"),
-                }
-            });
+                    // Origin: known user dot, else a fresh CoreLocation fix
+                    // (cached by the map), else the map center.
+                    let mut from_center = false;
+                    let origin = map.user_location().or_else(|| {
+                        corelocation::get_location()
+                            .ok()
+                            .map(|loc| {
+                                let c = Coordinate::new(
+                                    loc.coordinates.latitude,
+                                    loc.coordinates.longitude,
+                                );
+                                map.set_user_location(c);
+                                c
+                            })
+                    }).unwrap_or_else(|| {
+                        from_center = true;
+                        map.camera().center
+                    });
+                    let Some(dest) = places.iter().min_by(|a, b| {
+                        let da = a.coordinate.distance_to(&origin);
+                        let db = b.coordinate.distance_to(&origin);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    }) else {
+                        return;
+                    };
+                    if from_center {
+                        println!("[maps_demo] no location available, routing from map center");
+                    }
+                    println!("[maps_demo] routing to nearest result: {}", dest.name);
+                    match ProviderChain::default_providers()
+                        .route(origin, dest.coordinate, TravelMode::Driving)
+                    {
+                        Ok(route) => {
+                            println!(
+                                "[maps_demo] route {} / {} via {}",
+                                route.distance_text(),
+                                route.duration_text(),
+                                route.source
+                            );
+                            for step in route.steps.iter().take(5) {
+                                println!("   - {}", step.instruction);
+                            }
+                            map.display_route(&route);
+                        }
+                        Err(e) => eprintln!("[maps_demo] route failed: {e}"),
+                    }
+                });
+            }
         });
 
         let locate_map = map.clone();
@@ -86,6 +133,7 @@ impl MapsDemo {
             route_button,
             locate_button,
             map,
+            results: route_results,
             watcher: ThemeWatcher::new(),
             focused: true,
             bg: tontooui::renderer::window::BACKGROUND,
@@ -101,6 +149,7 @@ impl MapsDemo {
         }
         let center = self.map.camera().center;
         let map = self.map.clone();
+        let results = self.results.clone();
         std::thread::spawn(move || {
             match ProviderChain::default_providers().search(&query, Some(center), 10) {
                 Ok(places) => {
@@ -116,6 +165,10 @@ impl MapsDemo {
                     }
                     for place in &places {
                         println!("  {} - {}", place.name, place.address.one_line());
+                    }
+                    // Remember the results so Route can pick the nearest one.
+                    if let Ok(mut slot) = results.lock() {
+                        *slot = places.clone();
                     }
                     if let Some(first) = places.first() {
                         map.show_place(first);

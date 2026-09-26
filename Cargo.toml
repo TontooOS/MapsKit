@@ -21,6 +21,9 @@ parley = "0.11"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[dev-dependencies]
+corelocation = { path = "../CoreLocation" }
+
 [[example]]
 name = "maps_demo"
 path = "examples/maps_demo.rs"
