@@ -1589,7 +1589,8 @@ impl MapView {
     fn wheel_at(&mut self, dx: f64, dy: f64) {
         let _ = dx;
         // TontooUI reports scroll deltas in logical px (right/down
-        // positive); one notch (~20 px) is one zoom level. The step is
+        // positive); one notch (~20 px) is one zoom level. Zooms around
+        // the viewport center so the image stays put. The step is
         // animated (~200 ms ease-out); the camera callback fires when the
         // animation completes.
         let delta = (-dy / 20.0).clamp(-3.0, 3.0);
@@ -1597,8 +1598,8 @@ impl MapView {
             return;
         }
         if let Ok(mut s) = self.shared.lock() {
-            let (ax, ay) = s.last_hover.unwrap_or((s.width / 2.0, s.height / 2.0));
-            s.begin_zoom_step(ax, ay, delta);
+            let (cx, cy) = (s.width / 2.0, s.height / 2.0);
+            s.begin_zoom_step(cx, cy, delta);
         }
     }
 }
