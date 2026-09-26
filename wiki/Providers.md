@@ -69,15 +69,15 @@ come from a Nominatim `lookup` with `extratags=1`; ids use the format
 |---|---|
 | Search / reverse geocoding / nearby | Komoot Photon (`photon.komoot.io`) |
 | Routing | FOSSGIS OSRM (`routing.openstreetmap.de`) |
-| Tiles | CARTO basemaps (`basemaps.cartocdn.com`), Voyager and Dark Matter |
+| Tiles (light) | Wikimedia `osm-intl` (`maps.wikimedia.org`, no key) |
+| Tiles (dark) | Esri dark gray canvas (`server.arcgisonline.com`, no key) |
 
-`supports_style` returns true for `MapStyle::Light` and `MapStyle::Dark`;
-the tile slug follows the configured style. The light style uses
-`rastertiles/voyager`, whose colorful cartography (green parks, blue water,
-orange roads) follows the Apple Maps look; the dark style uses `dark_all`.
-Nearby search queries Photon per category keyword biased to the center and
-filters results to the requested radius. Ids reuse the OSM element id
-(`osm:N123`) when Photon provides one, else `photon:<lat>,<lon>`.
+`supports_style` returns true for `MapStyle::Light` and `MapStyle::Dark`.
+(CARTO basemaps were used here before but now require an API key, so they
+are no longer used.) Nearby search queries Photon per category keyword
+biased to the center and filters results to the requested radius. Ids reuse
+the OSM element id (`osm:N123`) when Photon provides one, else
+`photon:<lat>,<lon>`.
 
 ## ProviderChain
 
@@ -87,7 +87,7 @@ use mapskit::{Coordinate, MapStyle, ProviderChain};
 let chain = ProviderChain::default_providers();
 assert_eq!(
     chain.names(),
-    vec!["Esri World Imagery", "OpenStreetMap", "Photon + CARTO"]
+    vec!["Esri World Imagery", "OpenStreetMap", "Photon + OSM/Esri"]
 );
 
 // Tries every provider until one succeeds.

@@ -96,7 +96,7 @@ impl TileCache {
     /// Creates the cache from the configuration, creating directories.
     ///
     /// `source_key` separates variants of one provider that serve different
-    /// imagery per style (e.g. CARTO Voyager vs Dark Matter), so switching
+    /// imagery per style (e.g. Wikimedia light vs Esri dark), so switching
     /// styles never reads tiles of another style. Use
     /// [`cache_source_key`] to derive it from a provider.
     pub fn new(config: &MapsConfiguration, provider_name: &str, source_key: &str) -> Self {
@@ -140,7 +140,7 @@ impl TileCache {
 
 /// Stable cache namespace for a tile source: provider name plus a hash of
 /// a sample tile URL. Two style variants that return different URLs (e.g.
-/// CARTO Voyager and Dark Matter) therefore never share one directory.
+/// Wikimedia light and Esri dark) therefore never share one directory.
 pub fn cache_source_key(provider: &dyn MapProvider) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -149,7 +149,8 @@ pub fn cache_source_key(provider: &dyn MapProvider) -> String {
 }
 
 /// Whether the bytes start with a supported image magic number. Raster map
-/// tiles arrive as PNG (OSM, CARTO) or JPEG (Esri World Imagery satellite).
+/// tiles arrive as PNG (OSM, Wikimedia, Esri canvas) or JPEG (Esri World
+/// Imagery satellite).
 fn is_supported_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0x89, b'P', b'N', b'G']) || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
 }
@@ -184,7 +185,7 @@ pub fn fetch_tile(
     }
     let bytes = resp.bytes().to_vec();
 
-    // Basic sanity check: PNG (OSM/CARTO) or JPEG (Esri satellite) magic.
+    // Basic sanity check: PNG (OSM/Wikimedia/Esri) or JPEG (Esri satellite) magic.
     if !is_supported_image(&bytes) {
         return Err(MapsError::Tile(
             "response is not a PNG or JPEG image".into(),

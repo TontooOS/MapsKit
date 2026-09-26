@@ -27,6 +27,7 @@
     "mapskit.map.attribution.osm": "\u00a9 OpenStreetMap-Mitwirkende",
     "mapskit.map.attribution.carto": "\u00a9 CARTO \u00a9 OpenStreetMap-Mitwirkende",
     "mapskit.map.attribution.esri": "\u00a9 Esri \u00a9 Maxar \u00a9 Earthstar Geographics",
+    "mapskit.map.attribution.esri_dark": "\u00a9 Esri \u00a9 OpenStreetMap-Mitwirkende",
     "mapskit.error.network": "Ein Netzwerkfehler ist aufgetreten.",
     "mapskit.error.parse": "Die Serverantwort konnte nicht gelesen werden.",
     "mapskit.error.provider": "Der Kartenanbieter hat einen Fehler gemeldet."

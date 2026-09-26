@@ -11,7 +11,7 @@
 //! | Priority | Provider | Tiles | Search / Geocoding | Places | Routing |
 //! |---|---|---|---|---|---|
 //! | Primary | OpenStreetMap | tile.openstreetmap.org | Nominatim | Overpass API | OSRM |
-//! | Fallback | Photon + CARTO | basemaps.cartocdn.com | Photon | Photon | FOSSGIS OSRM |
+//! | Fallback | Photon + OSM/Esri | Wikimedia / Esri canvas | Photon | Photon | FOSSGIS OSRM |
 //!
 //! ## Quick Start
 //!

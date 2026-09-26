@@ -6,8 +6,9 @@
 //!    (`MapStyle::Satellite` only).
 //! 2. [`OsmProvider`] (primary) — OpenStreetMap raster tiles, Nominatim
 //!    search/geocoding, Overpass place details and OSRM routing.
-//! 3. [`PhotonProvider`] (fallback) — CARTO basemap tiles, Komoot Photon
-//!    search/geocoding and the FOSSGIS OSRM instances for routing.
+//! 3. [`PhotonProvider`] (fallback) — Wikimedia / Esri basemap tiles,
+//!    Komoot Photon search/geocoding and the FOSSGIS OSRM instances for
+//!    routing.
 //!
 //! A [`ProviderChain`] tries every provider in order and returns the first
 //! successful result, so apps keep working when one service is down.
@@ -24,7 +25,7 @@ use std::sync::Arc;
 /// A map data provider. All methods are blocking; call them from worker
 /// threads, not from the UI thread.
 pub trait MapProvider: Send + Sync {
-    /// Human readable provider name (`"OpenStreetMap"`, `"Photon + CARTO"`).
+    /// Human readable provider name (`"OpenStreetMap"`, `"Photon + OSM/Esri"`).
     fn name(&self) -> &'static str;
 
     /// Whether the provider endpoints are reachable. Cheap check used before
@@ -84,7 +85,7 @@ pub trait MapProvider: Send + Sync {
 /// use mapskit::providers::ProviderChain;
 ///
 /// let chain = ProviderChain::default_providers();
-/// // Tries OpenStreetMap first, Photon/CARTO when OSM fails.
+/// // Tries OpenStreetMap first, Photon/fallback when OSM fails.
 /// ```
 pub struct ProviderChain {
     providers: Vec<Arc<dyn MapProvider>>,
@@ -97,7 +98,7 @@ impl ProviderChain {
     }
 
     /// The default chain: Esri satellite tiles, OpenStreetMap primary,
-    /// Photon + CARTO fallback.
+    /// Photon + OSM/Esri fallback.
     pub fn default_providers() -> Self {
         Self::new(vec![
             Arc::new(esri::EsriProvider::new()),

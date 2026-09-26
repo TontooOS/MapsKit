@@ -52,14 +52,14 @@ let png: Vec<u8> = tiles::fetch_tile(
 
 `fetch_tile` is blocking and must run on a worker thread. It checks the
 cache first, downloads through the provider on miss, validates the image
-magic number (PNG for OSM/CARTO, JPEG for Esri satellite), and stores the
+magic number (PNG for OSM/Wikimedia/Esri canvas, JPEG for Esri satellite), and stores the
 result.
 
 ## Caching
 
 `cache_source_key(provider)` derives a stable namespace from the provider
 name plus a hash of its sample tile URL, so style variants that serve
-different imagery (CARTO Voyager vs Dark Matter) never share files. The
+different imagery (Wikimedia light vs Esri dark) never share files. The
 `TileCache` writes PNG files to
 `<cache_dir>/tiles/<provider>-<source>/<z>/<x>/<y>.png`. The default cache directory
 is `$XDG_CACHE_HOME/tontoos/mapskit` or `~/.cache/tontoos/mapskit`; override
@@ -74,8 +74,8 @@ Providers declare the styles they can serve via
 | Style | Serving provider |
 |---|---|
 | `MapStyle::Standard` | OpenStreetMap standard cartography |
-| `MapStyle::Light` | CARTO Voyager (colorful, Apple Maps-like) |
-| `MapStyle::Dark` | CARTO `dark_all` |
+| `MapStyle::Light` | Wikimedia `osm-intl` |
+| `MapStyle::Dark` | Esri dark gray canvas |
 | `MapStyle::Satellite` | Esri World Imagery |
 
 `ProviderChain::tile_provider_for(style)` picks the first matching provider;

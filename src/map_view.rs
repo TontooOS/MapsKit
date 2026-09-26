@@ -32,7 +32,8 @@ use crate::types::{Coordinate, MapRegion, Route};
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use tontooui::elements::layout::View as TontooView;
 use tontooui::renderer::images::ImageLoader;
@@ -78,9 +79,13 @@ struct MapInner {
     camera: MapCamera,
     /// The currently rendered base map style (switchable at runtime).
     style: MapStyle,
-    /// Raw PNG/JPEG tile bytes by key (`None` = failed, draws a placeholder).
-    tiles: HashMap<TileKey, Option<Vec<u8>>>,
+    /// Raw PNG/JPEG tile bytes by key.
+    tiles: HashMap<TileKey, Vec<u8>>,
     pending: HashSet<TileKey>,
+    /// Failed tiles with the time of the last attempt. Entries are
+    /// retried after [`TILE_RETRY_AFTER`]; the offline badge shows while
+    /// any currently visible tile has a recent failure.
+    failed: HashMap<TileKey, Instant>,
     annotations: Vec<Annotation>,
     overlays: Vec<Overlay>,
     /// Last mouse press in view-logical px (for tap vs. drag detection).
@@ -113,13 +118,13 @@ impl MapInner {
     }
 
     fn attribution_key(&self) -> &'static str {
-        let name = self.tile_provider().name();
-        if name.contains("CARTO") {
-            "mapskit.map.attribution.carto"
-        } else if name.contains("Esri") {
-            "mapskit.map.attribution.esri"
-        } else {
-            "mapskit.map.attribution.osm"
+        // Attribution follows the active imagery, not the provider name:
+        // satellite and dark canvas are Esri services, everything else is
+        // OpenStreetMap data (OSM standard tiles, Wikimedia osm-intl).
+        match self.style {
+            MapStyle::Satellite => "mapskit.map.attribution.esri",
+            MapStyle::Dark => "mapskit.map.attribution.esri_dark",
+            _ => "mapskit.map.attribution.osm",
         }
     }
 
@@ -229,108 +234,188 @@ impl MapInner {
         self.style = style;
         self.tiles.clear();
         self.pending.clear();
+        self.failed.clear();
         log_debug(&format!("base layer switched to {style:?}"));
     }
 }
 
 /// Requests all visible tiles that are not loaded yet.
+/// Number of concurrent tile downloads. Tile servers rate-limit parallel
+/// bursts (HTTP 429), so fetches go through a small shared worker pool
+/// instead of one thread per tile.
+const TILE_WORKERS: usize = 6;
+/// Failed tiles are retried after this cooldown instead of staying blank
+/// forever.
+const TILE_RETRY_AFTER: Duration = Duration::from_secs(8);
+
+/// One tile download for the shared worker pool.
+struct TileJob {
+    chain: Arc<ProviderChain>,
+    style: MapStyle,
+    provider_name: String,
+    cache_source: String,
+    user_agent: String,
+    timeout_seconds: u64,
+    cache_config: MapsConfiguration,
+    key: TileKey,
+    /// Weak so a dropped view never keeps jobs (or workers) alive.
+    target: Weak<Mutex<MapInner>>,
+}
+
+static TILE_POOL: OnceLock<std::sync::mpsc::Sender<TileJob>> = OnceLock::new();
+
+/// The process-wide tile download pool: [`TILE_WORKERS`] threads draining
+/// one queue, shared by all map views.
+fn tile_pool() -> &'static std::sync::mpsc::Sender<TileJob> {
+    TILE_POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<TileJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for worker in 0..TILE_WORKERS {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("mapskit-tiles-{worker}"))
+                .spawn(move || loop {
+                    let job = { rx.lock().expect("tile queue poisoned").recv() };
+                    let Ok(job) = job else { return };
+                    let provider = job
+                        .chain
+                        .tile_provider_for(job.style)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            job.chain
+                                .tile_provider_for(MapStyle::Standard)
+                                .cloned()
+                                .expect("chain empty")
+                        });
+                    let cache =
+                        TileCache::new(&job.cache_config, &job.provider_name, &job.cache_source);
+                    let result = tiles::fetch_tile(
+                        provider.as_ref(),
+                        &cache,
+                        job.key,
+                        &job.user_agent,
+                        job.timeout_seconds,
+                    );
+                    let Some(shared) = job.target.upgrade() else {
+                        continue;
+                    };
+                    let Ok(mut s) = shared.lock() else {
+                        continue;
+                    };
+                    // The layer may have changed while downloading; results
+                    // of the old layer must not pollute the new one (its
+                    // caches were cleared on switch).
+                    if s.style != job.style {
+                        continue;
+                    }
+                    s.pending.remove(&job.key);
+                    match result {
+                        Ok(bytes) => {
+                            s.tiles.insert(job.key, bytes);
+                            s.failed.remove(&job.key);
+                        }
+                        Err(e) => {
+                            s.failed.insert(job.key, Instant::now());
+                            log_debug(&format!(
+                                "tile {}/{}/{} failed: {}",
+                                job.key.z, job.key.x, job.key.y, e
+                            ));
+                        }
+                    }
+                })
+                .expect("tile worker spawn failed");
+        }
+        tx
+    })
+}
+
+/// Visible tile range for the current camera and viewport.
+fn visible_tile_range(
+    center: Coordinate,
+    zoom: u8,
+    zoom_scale: f64,
+    width: f64,
+    height: f64,
+) -> (i64, i64, i64, i64) {
+    let view_tiles_x = width / (TILE_SIZE * zoom_scale);
+    let view_tiles_y = height / (TILE_SIZE * zoom_scale);
+    let (cfx, cfy) = tiles::tile_for(center, zoom);
+    let max_tiles = (1i64 << zoom) - 1;
+    let min_x = ((cfx - view_tiles_x / 2.0).floor() as i64).clamp(0, max_tiles);
+    let max_x = ((cfx + view_tiles_x / 2.0).floor() as i64).clamp(0, max_tiles);
+    let min_y = (cfy - view_tiles_y / 2.0).floor().max(0.0) as i64;
+    let max_y = ((cfy + view_tiles_y / 2.0).floor() as i64).min(max_tiles);
+    (min_x, max_x, min_y, max_y)
+}
+
+/// Requests all visible tiles that are not loaded yet.
 ///
 /// Snapshots the wanted keys plus provider details under the lock, then
-/// spawns one worker thread per tile. Threads write back into the shared
-/// state directly; the TontooUI shell redraws continuously, so no explicit
-/// invalidation is needed.
+/// queues one job per tile on the shared worker pool. Workers write back
+/// into the shared state directly; the TontooUI shell redraws
+/// continuously, so no explicit invalidation is needed.
 fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
-    let (wanted, provider_name, cache_source, user_agent, timeout, cache_config) = {
-        let Ok(s) = shared.lock() else { return };
+    let now = Instant::now();
+    let jobs: Vec<TileJob> = {
+        let Ok(mut s) = shared.lock() else { return };
         let zoom = s.camera.zoom.round() as u8;
         let scale = (s.camera.zoom - f64::from(zoom)).exp2();
+        let (min_x, max_x, min_y, max_y) =
+            visible_tile_range(s.camera.center, zoom, scale, s.width, s.height);
 
-        let view_tiles_x = s.width / (TILE_SIZE * scale);
-        let view_tiles_y = s.height / (TILE_SIZE * scale);
-
-        let (cfx, cfy) = tiles::tile_for(s.camera.center, zoom);
-        let max_tiles = (1i64 << zoom) - 1;
-        let min_x = ((cfx - view_tiles_x / 2.0).floor() as i64).clamp(0, max_tiles);
-        let max_x = ((cfx + view_tiles_x / 2.0).floor() as i64).clamp(0, max_tiles);
-        let min_y = (cfy - view_tiles_y / 2.0).floor().max(0.0) as i64;
-        let max_y = ((cfy + view_tiles_y / 2.0).floor() as i64).min(max_tiles);
-
-        let mut list = Vec::new();
-        for ty in min_y..=max_y {
-            for tx in min_x..=max_x {
-                let key = TileKey::new(zoom, tx as u32, ty as u32);
-                if !s.tiles.contains_key(&key) && !s.pending.contains(&key) {
-                    list.push(key);
-                }
-            }
-        }
         let provider = s.tile_provider();
         let cache_source = tiles::cache_source_key(provider.as_ref());
-        (
-            list,
-            provider.name().to_string(),
-            cache_source,
+        let provider_name = provider.name().to_string();
+        let snapshot = (
+            s.chain.clone(),
+            s.style,
             s.config.user_agent.clone(),
             s.config.timeout_seconds,
             s.config.clone(),
-        )
-    };
+        );
+        let (chain, style, user_agent, timeout_seconds, cache_config) = snapshot;
 
-    if wanted.is_empty() {
-        return;
-    }
-
-    let chain = {
-        let Ok(s) = shared.lock() else { return };
-        s.chain.clone()
-    };
-    let style = {
-        let Ok(s) = shared.lock() else { return };
-        s.style
-    };
-
-    for key in wanted {
-        {
-            let Ok(mut s) = shared.lock() else { break };
-            if s.pending.contains(&key) || s.tiles.contains_key(&key) {
-                continue;
+        let mut jobs = Vec::new();
+        for ty in min_y..=max_y {
+            for tx in min_x..=max_x {
+                let key = TileKey::new(zoom, tx as u32, ty as u32);
+                if s.tiles.contains_key(&key) || s.pending.contains(&key) {
+                    continue;
+                }
+                // Skip recent failures; retry once the cooldown expired.
+                if let Some(failed_at) = s.failed.get(&key) {
+                    if now.duration_since(*failed_at) < TILE_RETRY_AFTER {
+                        continue;
+                    }
+                    s.failed.remove(&key);
+                }
+                s.pending.insert(key);
+                jobs.push(TileJob {
+                    chain: chain.clone(),
+                    style,
+                    provider_name: provider_name.clone(),
+                    cache_source: cache_source.clone(),
+                    user_agent: user_agent.clone(),
+                    timeout_seconds,
+                    cache_config: cache_config.clone(),
+                    key,
+                    target: Arc::downgrade(shared),
+                });
             }
-            s.pending.insert(key);
         }
 
-        let shared = shared.clone();
-        let chain = chain.clone();
-        let provider_name = provider_name.clone();
-        let cache_source = cache_source.clone();
-        let user_agent = user_agent.clone();
-        let cache_config = cache_config.clone();
-        std::thread::spawn(move || {
-            let provider = chain.tile_provider_for(style).cloned().unwrap_or_else(|| {
-                chain
-                    .tile_provider_for(MapStyle::Standard)
-                    .cloned()
-                    .expect("chain empty")
-            });
-            let cache = TileCache::new(&cache_config, &provider_name, &cache_source);
-            let result = tiles::fetch_tile(provider.as_ref(), &cache, key, &user_agent, timeout);
-            if let Ok(mut s) = shared.lock() {
-                s.pending.remove(&key);
-                match result {
-                    Ok(bytes) => {
-                        s.offline = false;
-                        s.tiles.insert(key, Some(bytes));
-                    }
-                    Err(e) => {
-                        s.offline = true;
-                        s.tiles.insert(key, None);
-                        log_debug(&format!(
-                            "tile {}/{}/{} failed: {}",
-                            key.z, key.x, key.y, e
-                        ));
-                    }
-                }
-            }
+        // Offline badge: on while any currently visible tile failed.
+        s.offline = (min_y..=max_y).any(|ty| {
+            (min_x..=max_x).any(|tx| s.failed.contains_key(&TileKey::new(zoom, tx as u32, ty as u32)))
         });
+        jobs
+    };
+
+    for job in jobs {
+        // The pool lives for the process lifetime; send only fails when
+        // all workers died, in which case the pending flag stays and the
+        // next frame re-queues the tile.
+        let _ = tile_pool().send(job);
     }
 }
 
@@ -375,7 +460,7 @@ fn draw_tiles(
             let lx = ox + (tx as f64 * TILE_SIZE - origin_x) * zoom_scale;
             let ly = oy + (ty as f64 * TILE_SIZE - origin_y) * zoom_scale;
             match inner.tiles.get(&key) {
-                Some(Some(bytes)) => {
+                Some(bytes) => {
                     let cache_key = tile_image_key(&provider_name, &source, key);
                     if let Some((image, iw, _ih)) = images.raster(&cache_key, bytes, 512) {
                         let s = (tile_draw / iw as f64) * dpr;
@@ -737,15 +822,23 @@ fn draw_layer_toggle(
     h: f32,
 ) -> Option<(f64, f64, f64, f64)> {
     let label = layer_toggle_label(inner);
-    let layout = fonts.layout_text(
-        &label,
-        11.0,
-        match inner.style {
-            MapStyle::Dark | MapStyle::Satellite => Color::WHITE,
-            _ => Color::from_rgb8(0x27, 0x27, 0x27),
-        },
-        None,
-    );
+    let dark = matches!(inner.style, MapStyle::Dark | MapStyle::Satellite);
+    // Frosted pill: light fill with dark text in light mode, dark fill
+    // with white text in dark/satellite mode.
+    let (fill, line, text) = if dark {
+        (
+            Color::from_rgba8(20, 22, 24, 200),
+            Color::from_rgba8(255, 255, 255, 46),
+            Color::WHITE,
+        )
+    } else {
+        (
+            Color::from_rgba8(255, 255, 255, 225),
+            Color::from_rgba8(0, 0, 0, 46),
+            Color::from_rgb8(0x27, 0x27, 0x27),
+        )
+    };
+    let layout = fonts.layout_text(&label, 11.0, text, None);
     let (lw, lh) = FontSystem::layout_size(&layout);
     let (lw, lh) = (lw / fonts.scale, lh / fonts.scale);
 
@@ -758,10 +851,6 @@ fn draw_layer_toggle(
     let y = oy + h - ph - MARGIN;
     let dpr = fonts.scale as f64;
 
-    let fill_alpha: u8 = match inner.style {
-        MapStyle::Dark | MapStyle::Satellite => 31,
-        _ => 217,
-    };
     let plate = RoundedRect::new(
         x as f64 * dpr,
         y as f64 * dpr,
@@ -772,7 +861,7 @@ fn draw_layer_toggle(
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
-        &Brush::Solid(Color::from_rgba8(0, 0, 0, fill_alpha)),
+        &Brush::Solid(fill),
         None,
         &plate,
     );
@@ -783,14 +872,10 @@ fn draw_layer_toggle(
         ((y + ph) as f64 - 0.5) * dpr,
         (ph / 2.0) as f64 * dpr,
     );
-    let line_color = match inner.style {
-        MapStyle::Dark | MapStyle::Satellite => Color::from_rgba8(255, 255, 255, 46),
-        _ => Color::from_rgba8(0, 0, 0, 46),
-    };
     scene.stroke(
         &Stroke::new(1.0 * dpr),
         Affine::IDENTITY,
-        &Brush::Solid(line_color),
+        &Brush::Solid(line),
         None,
         &border,
     );
@@ -832,6 +917,7 @@ impl MapView {
                 style: config.style,
                 tiles: HashMap::new(),
                 pending: HashSet::new(),
+                failed: HashMap::new(),
                 annotations: Vec::new(),
                 overlays: Vec::new(),
                 press: None,

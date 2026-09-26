@@ -40,9 +40,9 @@ pointer one-to-one and never accelerates during long drags.
 The layer pill at the bottom left shows the name of the layer it switches to
 ("Satellite" in map mode, "Standard" in satellite mode) and uses the
 localized strings `mapskit.map.satellite` / `mapskit.map.standard`. The
-attribution badge updates per layer (`mapskit.map.attribution.esri` while
-satellite imagery is shown). A press on the pill never starts a pan or an
-annotation tap.
+attribution badge updates per style (`mapskit.map.attribution.esri` for
+satellite, `mapskit.map.attribution.esri_dark` for dark, OSM otherwise). A
+press on the pill never starts a pan or an annotation tap.
 
 ## Camera API
 
@@ -133,13 +133,17 @@ CoreLocation failures are only logged when `MAPSKIT_DEBUG=1`.
 
 ## Tile Loading Behavior
 
-- Visible tiles are requested during the draw pass; missing ones spawn one
-  worker thread each.
-- Threads fetch through the disk cache and write raw bytes into shared
+- Visible tiles are requested during the draw pass; missing ones are queued
+  on a process-wide worker pool (6 threads), since tile servers
+  rate-limit parallel bursts.
+- Workers fetch through the disk cache and write raw bytes into shared
   state. The TontooUI shell redraws continuously, so tiles appear on the
   next frame with no explicit invalidation.
 - `ImageLoader::raster` decodes and uploads each tile once per cache key
   (`mapskit/<provider>/<source>/<z>/<x>/<y>`).
+- Failed tiles retry after an 8 s cooldown instead of staying blank; the
+  offline badge shows while any currently visible tile has a recent
+  failure and clears once the viewport is fully loaded.
 - Switching the base style drops all cached tiles of the old layer.
 - While loading, placeholder rectangles tinted per style are drawn; after a
   failure an offline badge appears top-left.

@@ -3,7 +3,7 @@
  *
  * Maps framework for TontooOS: interactive 2D map views, place search,
  * geocoding, routing and an optional globe view. Two providers are built
- * in with automatic fallback (OpenStreetMap primary; Photon + CARTO
+ * in with automatic fallback (OpenStreetMap primary; Photon + OSM/Esri
  * fallback). No API keys required.
  *
  * Views render inside TontooUI from Rust. The view handles below are

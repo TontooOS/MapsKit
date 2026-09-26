@@ -1,10 +1,11 @@
-//! Fallback provider: Komoot Photon + CARTO basemaps.
+//! Fallback provider: Komoot Photon + keyless basemaps.
 //!
 //! - Search / geocoding: Photon (`photon.komoot.io`)
 //! - Nearby places: Photon category keyword search around a center
 //! - Routing: FOSSGIS OSRM instances (`routing.openstreetmap.de`)
-//! - Tiles: CARTO basemaps (`basemaps.cartocdn.com`), Voyager (light) and
-//!   Dark Matter (dark)
+//! - Tiles: Wikimedia `osm-intl` (light) and Esri `World_Dark_Gray_Base`
+//!   (dark). Both are free without API keys. (CARTO basemaps previously
+//!   used here now require an API key and are no longer used.)
 
 use super::osm::fetch_osrm_route;
 use super::{get_with_query, http_client, response_json, MapProvider};
@@ -15,7 +16,7 @@ use crate::types::{
 };
 use serde_json::Value;
 
-/// Photon + CARTO backed provider (fallback).
+/// Photon + keyless basemap backed provider (fallback).
 pub struct PhotonProvider {
     user_agent: String,
     timeout_seconds: u64,
@@ -46,17 +47,6 @@ impl PhotonProvider {
 
     fn client(&self) -> networkkit::http::HttpClient {
         http_client(&self.user_agent, self.timeout_seconds)
-    }
-
-    /// CARTO basemap slug for the configured style.
-    ///
-    /// The light style uses CARTO Voyager, whose colorful cartography
-    /// (green parks, blue water, orange roads) follows the Apple Maps look.
-    fn carto_slug(&self) -> &'static str {
-        match self.style {
-            MapStyle::Dark => "dark_all",
-            _ => "rastertiles/voyager",
-        }
     }
 
     fn query(&self, params: &[(&str, String)]) -> Result<Value, MapsError> {
@@ -167,10 +157,10 @@ impl Default for PhotonProvider {
 
 impl MapProvider for PhotonProvider {
     fn name(&self) -> &'static str {
-        "Photon + CARTO"
+        "Photon + OSM/Esri"
     }
 
-    /// Serves the light and dark CARTO basemaps.
+    /// Serves the light (Wikimedia) and dark (Esri canvas) basemaps.
     fn supports_style(&self, style: MapStyle) -> bool {
         matches!(style, MapStyle::Light | MapStyle::Dark)
     }
@@ -336,11 +326,16 @@ impl MapProvider for PhotonProvider {
         )
     }
 
+    /// Keyless basemap tiles for the configured style: Wikimedia
+    /// `osm-intl` for light, Esri dark gray canvas for dark (ArcGIS serves
+    /// row-first: `/tile/{z}/{y}/{x}`).
     fn tile_url(&self, x: u32, y: u32, z: u8) -> String {
-        format!(
-            "https://basemaps.cartocdn.com/{}/{z}/{x}/{y}.png",
-            self.carto_slug()
-        )
+        match self.style {
+            MapStyle::Dark => format!(
+                "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+            ),
+            _ => format!("https://maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png"),
+        }
     }
 }
 
@@ -366,13 +361,13 @@ mod tests {
         let light = PhotonProvider::with_config(&MapsConfiguration::new().style(MapStyle::Light));
         assert_eq!(
             light.tile_url(5, 6, 7),
-            "https://basemaps.cartocdn.com/rastertiles/voyager/7/5/6.png"
+            "https://maps.wikimedia.org/osm-intl/7/5/6.png"
         );
 
         let dark = PhotonProvider::with_config(&MapsConfiguration::new().style(MapStyle::Dark));
         assert_eq!(
             dark.tile_url(5, 6, 7),
-            "https://basemaps.cartocdn.com/dark_all/7/5/6.png"
+            "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/7/6/5"
         );
     }
 
