@@ -29,7 +29,7 @@ let stack = VStack::new().child(map);
 | Input | Action |
 |---|---|
 | Drag | Pan (content follows the pointer) |
-| Scroll | Animated zoom around the viewport center (~200 ms ease-out per notch) |
+| Scroll | Zoom around the viewport center (notches glide ~200 ms ease-out, touchpad deltas apply 1:1) |
 | Tap on a pin | Fires the annotation-tapped callback |
 | Tap on layer pill (bottom left) | Switch between satellite imagery and the base style |
 

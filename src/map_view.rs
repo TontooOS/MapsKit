@@ -72,6 +72,12 @@ fn log_debug(message: &str) {
 
 /// Duration of one animated zoom step.
 const ZOOM_ANIM_DURATION: Duration = Duration::from_millis(200);
+/// Wheel steps at or above this size animate; smaller (touchpad-style)
+/// deltas apply instantly 1:1. A classic mouse notch is 1.0, so notches
+/// glide while smooth-scroll devices stay direct. Without this split,
+/// continuous small deltas would restart the animation on every tick and
+/// it would rubber-band instead of landing.
+const WHEEL_ANIM_THRESHOLD: f64 = 0.75;
 
 /// Ease-out cubic: fast start, soft landing.
 fn ease_out_cubic(t: f64) -> f64 {
@@ -292,6 +298,29 @@ impl MapInner {
             to_zoom,
             start: now,
         });
+    }
+
+    /// Applies a zoom step around a screen anchor immediately (no
+    /// animation), cancelling any running animation first. Returns the
+    /// camera callback payload.
+    fn zoom_immediate(
+        &mut self,
+        x: f64,
+        y: f64,
+        delta: f64,
+        now: Instant,
+    ) -> Option<(CameraCallback, MapCamera)> {
+        self.cancel_anim(now);
+        let (to_center, to_zoom) =
+            self.zoom_target(self.camera.center, self.camera.zoom, x, y, delta);
+        if (to_zoom - self.camera.zoom).abs() < f64::EPSILON
+            && to_center == self.camera.center
+        {
+            return None;
+        }
+        self.camera.center = to_center;
+        self.camera.zoom = to_zoom;
+        self.on_camera_changed.clone().map(|cb| (cb, self.camera))
     }
 
     /// Advances a running zoom animation to `now`. Returns the camera
@@ -1652,16 +1681,27 @@ impl MapView {
         let _ = dx;
         // TontooUI reports scroll deltas in logical px (right/down
         // positive); one notch (~20 px) is one zoom level. Zooms around
-        // the viewport center so the image stays put. The step is
-        // animated (~200 ms ease-out); the camera callback fires when the
-        // animation completes.
+        // the viewport center so the image stays put. Full notches glide
+        // (~200 ms ease-out, callback on landing); small touchpad-style
+        // deltas apply instantly 1:1.
         let delta = (-dy / 20.0).clamp(-3.0, 3.0);
         if delta == 0.0 {
             return;
         }
-        if let Ok(mut s) = self.shared.lock() {
-            let (cx, cy) = (s.width / 2.0, s.height / 2.0);
-            s.begin_zoom_step(cx, cy, delta);
+        let callback = match self.shared.lock() {
+            Ok(mut s) => {
+                let (cx, cy) = (s.width / 2.0, s.height / 2.0);
+                if delta.abs() >= WHEEL_ANIM_THRESHOLD {
+                    s.begin_zoom_step(cx, cy, delta);
+                    None
+                } else {
+                    s.zoom_immediate(cx, cy, delta, Instant::now())
+                }
+            }
+            Err(_) => None,
+        };
+        if let Some((cb, camera)) = callback {
+            cb(&camera);
         }
     }
 }
@@ -1891,6 +1931,26 @@ mod tests {
             assert!((s.camera.zoom - 11.0).abs() < 1e-9);
             // No callback registered, so nothing to fire.
             assert!(done.is_none());
+        }
+    }
+
+    #[test]
+    fn zoom_immediate_applies_without_animation() {
+        let map = MapView::new(&MapsConfiguration::new());
+        map.set_center(Coordinate::new(52.52, 13.405), 10.0);
+        {
+            let mut s = map.shared.lock().unwrap();
+            s.width = 800.0;
+            s.height = 600.0;
+            let fired =
+                s.zoom_immediate(400.0, 300.0, 1.0, Instant::now());
+            assert!(s.zoom_anim.is_none());
+            assert!((s.camera.zoom - 11.0).abs() < 1e-9);
+            // No callback registered, so nothing to fire.
+            assert!(fired.is_none());
+            // Zooming at the center keeps the center fixed.
+            assert!((s.camera.center.latitude - 52.52).abs() < 1e-6);
+            assert!((s.camera.center.longitude - 13.405).abs() < 1e-6);
         }
     }
 
