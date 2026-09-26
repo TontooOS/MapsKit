@@ -146,8 +146,13 @@ refreshes the cache as well.
 - `ImageLoader::raster` decodes and uploads each tile once per cache key
   (`mapskit/<provider>/<source>/<z>/<x>/<y>`).
 - Failed tiles retry after an 8 s cooldown instead of staying blank; the
-  offline badge shows while any currently visible tile has a recent
-  failure and clears once the viewport is fully loaded.
+  offline badge shows while any tile inside the actual viewport has a
+  recent failure and clears once the viewport is fully loaded.
+- A 1-tile prefetch ring around the viewport loads ahead of panning;
+  center-first ordering keeps visible tiles ahead of the ring.
+- Overzoom: while zooming, missing tiles render from the nearest loaded
+  parent (up to 4 levels up, scaled and clipped) or from loaded children
+  when zooming out, so no gray placeholders flash mid-gesture.
 - Switching the base style drops all cached tiles of the old layer.
 - While loading, placeholder rectangles tinted per style are drawn; after a
   failure an offline badge appears top-left.

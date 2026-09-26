@@ -254,6 +254,10 @@ const LOCATION_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Failed tiles are retried after this cooldown instead of staying blank
 /// forever.
 const TILE_RETRY_AFTER: Duration = Duration::from_secs(8);
+/// Extra tile ring loaded around the viewport so panning never shows
+/// placeholders. Center-first ordering keeps visible tiles ahead of the
+/// prefetch ring.
+const PREFETCH_MARGIN: i64 = 1;
 
 /// One tile download for the shared worker pool.
 struct TileJob {
@@ -367,8 +371,18 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
         let Ok(mut s) = shared.lock() else { return };
         let zoom = s.camera.zoom.round() as u8;
         let scale = (s.camera.zoom - f64::from(zoom)).exp2();
-        let (min_x, max_x, min_y, max_y) =
+        let (vis_min_x, vis_max_x, vis_min_y, vis_max_y) =
             visible_tile_range(s.camera.center, zoom, scale, s.width, s.height);
+        // Prefetch ring around the viewport (clamped to the world).
+        let world_max = (1i64 << zoom) - 1;
+        let (min_x, max_x) = (
+            (vis_min_x - PREFETCH_MARGIN).max(0),
+            (vis_max_x + PREFETCH_MARGIN).min(world_max),
+        );
+        let (min_y, max_y) = (
+            (vis_min_y - PREFETCH_MARGIN).max(0),
+            (vis_max_y + PREFETCH_MARGIN).min(world_max),
+        );
 
         let provider = s.tile_provider();
         let cache_source = tiles::cache_source_key(provider.as_ref());
@@ -422,9 +436,11 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Offline badge: on while any currently visible tile failed.
-        s.offline = (min_y..=max_y).any(|ty| {
-            (min_x..=max_x).any(|tx| s.failed.contains_key(&TileKey::new(zoom, tx as u32, ty as u32)))
+        // Offline badge: on while any tile inside the actual viewport
+        // (not the prefetch ring) failed.
+        s.offline = (vis_min_y..=vis_max_y).any(|ty| {
+            (vis_min_x..=vis_max_x)
+                .any(|tx| s.failed.contains_key(&TileKey::new(zoom, tx as u32, ty as u32)))
         });
         jobs
     };
@@ -444,6 +460,64 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
 /// Cache key for a tile inside TontooUI's [`ImageLoader`].
 fn tile_image_key(provider: &str, source: &str, key: TileKey) -> String {
     format!("mapskit/{provider}/{source}/{}/{}/{}", key.z, key.x, key.y)
+}
+
+/// How many zoom levels up the parent fallback search goes. Beyond that
+/// the upscaled imagery is too blurry to be worth drawing.
+const OVERZOOM_PARENT_LEVELS: u8 = 4;
+
+/// Fallback imagery for a missing tile: the nearest loaded parent tile.
+///
+/// Returns the parent key plus the missing tile's offset inside it
+/// (`ox`, `oy` in parent sub-tiles) and the level difference. Renderers
+/// draw the parent image scaled up so the sub-region covers the missing
+/// tile exactly, which keeps the map flawless while zooming instead of
+/// flashing placeholders.
+fn parent_fallback(
+    tiles: &HashMap<TileKey, Vec<u8>>,
+    z: u8,
+    tx: u32,
+    ty: u32,
+) -> Option<(TileKey, u32, u32, u32)> {
+    for shift in 1..=OVERZOOM_PARENT_LEVELS {
+        let Some(pz) = z.checked_sub(shift) else {
+            break;
+        };
+        let px = tx >> shift;
+        let py = ty >> shift;
+        let parent = TileKey::new(pz, px, py);
+        if tiles.contains_key(&parent) {
+            return Some((parent, tx - (px << shift), ty - (py << shift), shift as u32));
+        }
+    }
+    None
+}
+
+/// Draws one tile image at a logical rect.
+fn draw_tile_image(
+    scene: &mut Scene,
+    images: &mut ImageLoader<'_>,
+    cache_key: &str,
+    bytes: &[u8],
+    lx: f64,
+    ly: f64,
+    logical_size: f64,
+    dpr: f64,
+) {
+    if let Some((image, iw, _ih)) = images.raster(cache_key, bytes, 512) {
+        let s = (logical_size / iw as f64) * dpr;
+        let transform = Affine::translate((lx * dpr, ly * dpr)) * Affine::scale(s);
+        scene.draw_image(&image, transform);
+    }
+}
+
+fn placeholder_rect(scene: &mut Scene, style: MapStyle, lx: f64, ly: f64, size: f64, dpr: f64) {
+    let fill = match style {
+        MapStyle::Dark | MapStyle::Satellite => Color::from_rgba8(255, 255, 255, 13),
+        _ => Color::from_rgba8(0, 0, 0, 15),
+    };
+    let rect = vello::kurbo::Rect::new(lx * dpr, ly * dpr, (lx + size) * dpr, (ly + size) * dpr);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(fill), None, &rect);
 }
 
 fn draw_tiles(
@@ -477,32 +551,67 @@ fn draw_tiles(
             let key = TileKey::new(z, tx as u32, ty as u32);
             let lx = ox + (tx as f64 * TILE_SIZE - origin_x) * zoom_scale;
             let ly = oy + (ty as f64 * TILE_SIZE - origin_y) * zoom_scale;
-            match inner.tiles.get(&key) {
-                Some(bytes) => {
-                    let cache_key = tile_image_key(&provider_name, &source, key);
-                    if let Some((image, iw, _ih)) = images.raster(&cache_key, bytes, 512) {
-                        let s = (tile_draw / iw as f64) * dpr;
-                        let transform = Affine::translate((lx * dpr, ly * dpr)) * Affine::scale(s);
-                        scene.draw_image(&image, transform);
-                    }
-                }
-                _ => {
-                    // Placeholder while loading.
-                    let fill = match inner.style {
-                        MapStyle::Dark | MapStyle::Satellite => {
-                            Color::from_rgba8(255, 255, 255, 13)
-                        }
-                        _ => Color::from_rgba8(0, 0, 0, 15),
-                    };
-                    let rect = vello::kurbo::Rect::new(
+            if let Some(bytes) = inner.tiles.get(&key) {
+                let cache_key = tile_image_key(&provider_name, &source, key);
+                draw_tile_image(scene, images, &cache_key, bytes, lx, ly, tile_draw, dpr);
+                continue;
+            }
+            // Overzoom: reuse a loaded parent tile scaled up so zooming
+            // never flashes empty placeholders.
+            if let Some((parent, off_x, off_y, shift)) =
+                parent_fallback(&inner.tiles, z, tx as u32, ty as u32)
+            {
+                if let Some(bytes) = inner.tiles.get(&parent) {
+                    let cache_key = tile_image_key(&provider_name, &source, parent);
+                    // The parent covers 2^shift sub-tiles per axis; draw it
+                    // large and clip to this tile's rect.
+                    let clip = vello::kurbo::Rect::new(
                         lx * dpr,
                         ly * dpr,
                         (lx + tile_draw) * dpr,
                         (ly + tile_draw) * dpr,
                     );
-                    scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(fill), None, &rect);
+                    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+                    draw_tile_image(
+                        scene,
+                        images,
+                        &cache_key,
+                        bytes,
+                        lx - off_x as f64 * tile_draw,
+                        ly - off_y as f64 * tile_draw,
+                        tile_draw * f64::from(1u32 << shift),
+                        dpr,
+                    );
+                    scene.pop_layer();
+                    continue;
                 }
             }
+            // Underzoom: reuse loaded children (one level down) per quadrant
+            // so zooming out also keeps imagery on screen.
+            if z < tiles::MAX_ZOOM {
+                let mut covered = false;
+                for (qx, qy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let child = TileKey::new(z + 1, tx as u32 * 2 + qx, ty as u32 * 2 + qy);
+                    if let Some(bytes) = inner.tiles.get(&child) {
+                        let cache_key = tile_image_key(&provider_name, &source, child);
+                        draw_tile_image(
+                            scene,
+                            images,
+                            &cache_key,
+                            bytes,
+                            lx + qx as f64 * tile_draw / 2.0,
+                            ly + qy as f64 * tile_draw / 2.0,
+                            tile_draw / 2.0,
+                            dpr,
+                        );
+                        covered = true;
+                    }
+                }
+                if covered {
+                    continue;
+                }
+            }
+            placeholder_rect(scene, inner.style, lx, ly, tile_draw, dpr);
         }
     }
 }
@@ -1434,6 +1543,47 @@ impl TontooView for MapView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_fallback_finds_nearest_loaded_parent() {
+        let mut tiles = HashMap::new();
+        // Missing tile 10/8/4: parent at z9 is (4, 2), grandparent at z8
+        // is (2, 1).
+        tiles.insert(TileKey::new(8, 2, 1), vec![1]);
+        tiles.insert(TileKey::new(9, 4, 2), vec![2]);
+        // Nearest parent wins with the sub-tile offset inside it.
+        assert_eq!(
+            parent_fallback(&tiles, 10, 8, 4),
+            Some((TileKey::new(9, 4, 2), 0, 0, 1))
+        );
+        // Odd tile coords produce the offset: 10/9/5 sits at (1, 1) inside
+        // parent 9/4/2.
+        assert_eq!(
+            parent_fallback(&tiles, 10, 9, 5),
+            Some((TileKey::new(9, 4, 2), 1, 1, 1))
+        );
+        // Without the z9 parent the z8 grandparent is used.
+        tiles.remove(&TileKey::new(9, 4, 2));
+        assert_eq!(
+            parent_fallback(&tiles, 10, 9, 5),
+            Some((TileKey::new(8, 2, 1), 1, 1, 2))
+        );
+    }
+
+    #[test]
+    fn parent_fallback_respects_depth_and_emptiness() {
+        let mut tiles = HashMap::new();
+        // Only a z0 world tile: reachable within 4 levels from z4.
+        tiles.insert(TileKey::new(0, 0, 0), vec![1]);
+        assert_eq!(
+            parent_fallback(&tiles, 4, 9, 5),
+            Some((TileKey::new(0, 0, 0), 9, 5, 4))
+        );
+        // Too deep: z5 is 5 levels above z0.
+        assert_eq!(parent_fallback(&tiles, 5, 20, 11), None);
+        // Empty cache: no fallback at all.
+        assert_eq!(parent_fallback(&HashMap::new(), 10, 8, 4), None);
+    }
 
     #[test]
     fn cached_location_centers_immediately() {

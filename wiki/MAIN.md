@@ -92,6 +92,9 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Changelog
 
+- 2026-09-26: Flawless zoom and pan: missing tiles render overzoomed from
+  the nearest loaded parent (or loaded children when zooming out), and a
+  1-tile prefetch ring loads around the viewport.
 - 2026-09-26: Location caching: `show_user_location` reuses the last fix
   for 60 s instead of querying CoreLocation on every press.
 - 2026-09-26: Light tiles now come from `tile.openstreetmap.org` (the same
