@@ -31,8 +31,8 @@ use crate::tiles::{self, TileCache, TileKey};
 use crate::types::{Coordinate, MapRegion, Route};
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use tontooui::elements::layout::View as TontooView;
@@ -369,7 +369,6 @@ impl MapInner {
     }
 }
 
-/// Requests all visible tiles that are not loaded yet.
 /// Number of concurrent tile downloads. Tile servers rate-limit parallel
 /// bursts (HTTP 429), so fetches go through a small shared worker pool
 /// instead of one thread per tile.
@@ -399,21 +398,32 @@ struct TileJob {
     target: Weak<Mutex<MapInner>>,
 }
 
-static TILE_POOL: OnceLock<std::sync::mpsc::Sender<TileJob>> = OnceLock::new();
+static TILE_QUEUE: OnceLock<Arc<(Mutex<VecDeque<TileJob>>, Condvar)>> = OnceLock::new();
 
-/// The process-wide tile download pool: [`TILE_WORKERS`] threads draining
-/// one queue, shared by all map views.
-fn tile_pool() -> &'static std::sync::mpsc::Sender<TileJob> {
-    TILE_POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<TileJob>();
-        let rx = Arc::new(Mutex::new(rx));
+/// The process-wide tile download queue, shared by all map views.
+/// Newest jobs are pushed at the back and workers pop from the back, so
+/// after a pan or zoom the fresh area jumps ahead of stale jobs instead
+/// of waiting behind them.
+fn tile_queue() -> &'static Arc<(Mutex<VecDeque<TileJob>>, Condvar)> {
+    TILE_QUEUE.get_or_init(|| {
+        let queue: Arc<(Mutex<VecDeque<TileJob>>, Condvar)> =
+            Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         for worker in 0..TILE_WORKERS {
-            let rx = rx.clone();
+            let queue = queue.clone();
             std::thread::Builder::new()
                 .name(format!("mapskit-tiles-{worker}"))
                 .spawn(move || loop {
-                    let job = { rx.lock().expect("tile queue poisoned").recv() };
-                    let Ok(job) = job else { return };
+                    let job = {
+                        let (lock, cvar) = &*queue;
+                        let mut jobs = lock.lock().expect("tile queue poisoned");
+                        while jobs.is_empty() {
+                            jobs = cvar.wait(jobs).expect("tile queue poisoned");
+                        }
+                        jobs.pop_back().expect("queue non-empty")
+                    };
+                    if !still_wanted(&job) {
+                        continue;
+                    }
                     let provider = job
                         .chain
                         .tile_provider_for(job.style)
@@ -462,8 +472,55 @@ fn tile_pool() -> &'static std::sync::mpsc::Sender<TileJob> {
                 })
                 .expect("tile worker spawn failed");
         }
-        tx
+        queue
     })
+}
+
+/// Whether a queued job is still worth downloading. Drops (and unmarks
+/// pending) jobs whose view is gone, whose layer changed, whose tile
+/// arrived meanwhile, or which scrolled out of the load range — so moving
+/// the map cancels old loads before they cost bandwidth instead of
+/// finishing them first.
+fn still_wanted(job: &TileJob) -> bool {
+    let Some(shared) = job.target.upgrade() else {
+        return false;
+    };
+    let Ok(mut s) = shared.lock() else {
+        return false;
+    };
+    if s.style != job.style || s.tiles.contains_key(&job.key) {
+        s.pending.remove(&job.key);
+        return false;
+    }
+    let zoom = s.camera.zoom.round() as u8;
+    let scale = (s.camera.zoom - f64::from(zoom)).exp2();
+    if !tile_in_load_range(s.camera.center, zoom, scale, s.width, s.height, job.key) {
+        s.pending.remove(&job.key);
+        return false;
+    }
+    true
+}
+
+/// Whether a tile is inside the current load range (viewport plus
+/// prefetch ring). Tiles of other zoom levels are always kept: they serve
+/// as overzoom parents or underzoom children.
+fn tile_in_load_range(
+    center: Coordinate,
+    zoom: u8,
+    zoom_scale: f64,
+    width: f64,
+    height: f64,
+    key: TileKey,
+) -> bool {
+    if key.z != zoom {
+        return true;
+    }
+    let (min_x, max_x, min_y, max_y) = visible_tile_range(center, zoom, zoom_scale, width, height);
+    let (x, y) = (key.x as i64, key.y as i64);
+    x >= min_x - PREFETCH_MARGIN
+        && x <= max_x + PREFETCH_MARGIN
+        && y >= min_y - PREFETCH_MARGIN
+        && y <= max_y + PREFETCH_MARGIN
 }
 
 /// Visible tile range for the current camera and viewport.
@@ -488,9 +545,10 @@ fn visible_tile_range(
 /// Requests all visible tiles that are not loaded yet.
 ///
 /// Snapshots the wanted keys plus provider details under the lock, then
-/// queues one job per tile on the shared worker pool. Workers write back
-/// into the shared state directly; the TontooUI shell redraws
-/// continuously, so no explicit invalidation is needed.
+/// pushes one job per tile on the shared worker queue (newest first).
+/// Workers check relevance before downloading and write back into the
+/// shared state directly; the TontooUI shell redraws continuously, so no
+/// explicit invalidation is needed.
 fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
     let now = Instant::now();
     let jobs: Vec<TileJob> = {
@@ -559,7 +617,9 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
                 + (f64::from(a.key.y) + 0.5 - cfy).powi(2);
             let db = (f64::from(b.key.x) + 0.5 - cfx).powi(2)
                 + (f64::from(b.key.y) + 0.5 - cfy).powi(2);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            // Descending: workers pop from the back, so the center tile
+            // ends up on top of the queue.
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Offline badge: on while any tile inside the actual viewport
@@ -571,11 +631,13 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
         jobs
     };
 
-    for job in jobs {
-        // The pool lives for the process lifetime; send only fails when
-        // all workers died, in which case the pending flag stays and the
-        // next frame re-queues the tile.
-        let _ = tile_pool().send(job);
+    // Push newest-first: workers pop from the back, so fresh jobs jump
+    // ahead of stale ones queued by previous frames.
+    let queue = tile_queue();
+    let (lock, cvar) = &**queue;
+    if let Ok(mut pending) = lock.lock() {
+        pending.extend(jobs);
+        cvar.notify_all();
     }
 }
 
@@ -1696,6 +1758,18 @@ impl TontooView for MapView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_in_load_range_covers_viewport_plus_ring() {
+        // Zoom 3 over the whole world at 800x600: visible tiles are a
+        // subset; the ring extends one further in each direction.
+        let center = Coordinate::new(52.52, 13.405);
+        assert!(tile_in_load_range(center, 3, 1.0, 800.0, 600.0, TileKey::new(3, 4, 2)));
+        // Far away at the same zoom: out of range, would be dropped.
+        assert!(!tile_in_load_range(center, 3, 1.0, 800.0, 600.0, TileKey::new(3, 0, 7)));
+        // Other zoom levels are always kept as overzoom fallback.
+        assert!(tile_in_load_range(center, 3, 1.0, 800.0, 600.0, TileKey::new(2, 0, 0)));
+    }
 
     #[test]
     fn parent_fallback_finds_nearest_loaded_parent() {

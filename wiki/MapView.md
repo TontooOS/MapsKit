@@ -143,9 +143,15 @@ refreshes the cache as well.
 
 ## Tile Loading Behavior
 
-- Visible tiles are requested during the draw pass; missing ones are queued
-  on a process-wide worker pool (6 threads), since tile servers
+- Visible tiles are requested during the draw pass; missing ones are
+  pushed on a process-wide worker queue (6 threads), since tile servers
   rate-limit parallel bursts.
+- The queue is newest-first: after a pan or zoom the fresh area jumps
+  ahead of stale jobs instead of waiting behind them.
+- Workers check relevance before downloading and skip jobs whose view is
+  gone, whose layer changed, whose tile arrived meanwhile, or which
+  scrolled out of the load range — moving the map cancels old loads
+  before they cost bandwidth instead of finishing them first.
 - Workers fetch through the disk cache and write raw bytes into shared
   state. The TontooUI shell redraws continuously, so tiles appear on the
   next frame with no explicit invalidation.

@@ -92,6 +92,8 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Changelog
 
+- 2026-09-26: Newest-first tile queue with relevance check: moving the
+  map cancels stale loads before they cost bandwidth.
 - 2026-09-26: Animated zoom: wheel steps ease out over ~200 ms and
   retarget mid-flight; pan/press/`set_camera` cancel seamlessly.
 - 2026-09-26: Flawless zoom and pan: missing tiles render overzoomed from
