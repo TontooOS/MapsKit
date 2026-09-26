@@ -4,8 +4,9 @@ TontooMapsKit is the maps framework for TontooOS. It follows Apple's MapKit
 design philosophy: an interactive `MapView`, a `MapCamera` viewport object,
 annotations and overlays, place search with details, forward/reverse
 geocoding, turn-by-turn routing, an optional 3D `GlobeView` and a C FFI.
-Three providers are built in with automatic fallback (Esri satellite tiles,
-OpenStreetMap primary, Photon + Esri fallback), so no API keys are required.
+Four providers are built in with automatic fallback (TontooOS backend
+first, Esri satellite tiles, OpenStreetMap primary, Photon + Esri
+fallback), so no API keys are required.
 
 - Repository: tontoo-os/TontooLibs/MapsKit
 - License: TCL
@@ -60,8 +61,10 @@ See [Providers.md](Providers.md), [MapView.md](MapView.md) and
 ```
 MapsConfiguration (style, POI filter, cache dir, user agent)
   |
-  +-- ProviderChain          (ordered fallback over MapProvider)
-  |     +-- EsriProvider     (Esri World Imagery satellite tiles)
+   +-- ProviderChain          (ordered fallback over MapProvider)
+   |     +-- BackendProvider    (TontooOS backend proxy: tiles, search,
+   |     |                       places, routes; driving routes only)
+   |     +-- EsriProvider     (Esri World Imagery satellite tiles)
   |     +-- OsmProvider      (Nominatim + Overpass + OSRM + OSM tiles)
   |     +-- PhotonProvider   (Photon + FOSSGIS OSRM + Esri dark tiles)
   |
@@ -92,6 +95,10 @@ MapsConfiguration (style, POI filter, cache dir, user agent)
 
 ## Changelog
 
+- 2026-09-26: TontooOS backend provider (primary): tiles, search,
+  places and driving routes go through `.../tontooos/api/maps`
+  (`backend_url` config / `TONTOO_BACKEND_URL`); tile downloads try every
+  matching provider in order with per-provider caches.
 - 2026-09-26: Newest-first tile queue with relevance check: moving the
   map cancels stale loads before they cost bandwidth.
 - 2026-09-26: Animated zoom: wheel notches ease out over ~200 ms and

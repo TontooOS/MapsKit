@@ -73,10 +73,16 @@ Providers declare the styles they can serve via
 
 | Style | Serving provider |
 |---|---|
-| `MapStyle::Standard` | OpenStreetMap standard cartography |
-| `MapStyle::Light` | OpenStreetMap cartography (same Fastly CDN tiles Leaflet uses) |
-| `MapStyle::Dark` | Esri dark gray canvas |
-| `MapStyle::Satellite` | Esri World Imagery |
+| `MapStyle::Standard` | TontooOS backend street proxy, else OpenStreetMap standard cartography |
+| `MapStyle::Light` | TontooOS backend street proxy, else OpenStreetMap cartography |
+| `MapStyle::Dark` | TontooOS backend dark proxy, else Esri dark gray canvas |
+| `MapStyle::Satellite` | TontooOS backend satellite proxy, else Esri World Imagery |
+
+`ProviderChain::tile_providers_for(style)` lists every matching provider;
+tile downloads try them in chain order until one succeeds, so a dead
+backend falls back to the direct providers transparently. Each provider
+keeps its own disk cache namespace and its own decoded-image keys, so
+fallback imagery never poisons another provider's cache.
 
 `ProviderChain::tile_provider_for(style)` picks the first matching provider;
 the map views call this whenever the style changes and evict their in-memory

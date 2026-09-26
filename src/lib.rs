@@ -10,6 +10,7 @@
 //!
 //! | Priority | Provider | Tiles | Search / Geocoding | Places | Routing |
 //! |---|---|---|---|---|
+//! | Primary | TontooOS Backend | proxied street/satellite/dark | backend | backend | backend (driving) |
 //! | Satellite | Esri World Imagery | ArcGIS imagery | - | - | - |
 //! | Primary | OpenStreetMap | tile.openstreetmap.org | Nominatim | Overpass API | OSRM |
 //! | Fallback | Photon + OSM/Esri | Esri dark canvas | Photon | Photon | FOSSGIS OSRM |

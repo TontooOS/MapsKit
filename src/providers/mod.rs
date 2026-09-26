@@ -1,17 +1,22 @@
 //! Map service providers and the fallback chain.
 //!
-//! MapsKit ships three providers:
+//! MapsKit ships four providers:
 //!
-//! 1. [`EsriProvider`] — Esri World Imagery satellite raster tiles
+//! 1. [`BackendProvider`] (primary) — the TontooOS backend maps API, which
+//!    proxies and caches tiles, search, places and routes. All TontooOS map
+//!    clients use it; when it is unreachable the chain falls through to the
+//!    direct providers below.
+//! 2. [`EsriProvider`] — Esri World Imagery satellite raster tiles
 //!    (`MapStyle::Satellite` only).
-//! 2. [`OsmProvider`] (primary) — OpenStreetMap raster tiles, Nominatim
+//! 3. [`OsmProvider`] — OpenStreetMap raster tiles, Nominatim
 //!    search/geocoding, Overpass place details and OSRM routing.
-//! 3. [`PhotonProvider`] (fallback) — Esri dark canvas tiles, Komoot
-//!    Photon search/geocoding and the FOSSGIS OSRM instances for routing.
+//! 4. [`PhotonProvider`] (fallback) — Esri dark canvas tiles, Komoot Photon
+//!    search/geocoding and the FOSSGIS OSRM instances for routing.
 //!
 //! A [`ProviderChain`] tries every provider in order and returns the first
 //! successful result, so apps keep working when one service is down.
 
+pub mod backend;
 pub mod esri;
 pub mod osm;
 pub mod photon;
@@ -96,10 +101,11 @@ impl ProviderChain {
         Self { providers }
     }
 
-    /// The default chain: Esri satellite tiles, OpenStreetMap primary,
-    /// Photon + OSM/Esri fallback.
+    /// The default chain: TontooOS backend first, Esri satellite tiles,
+    /// OpenStreetMap primary, Photon + OSM/Esri fallback.
     pub fn default_providers() -> Self {
         Self::new(vec![
+            Arc::new(backend::BackendProvider::new()),
             Arc::new(esri::EsriProvider::new()),
             Arc::new(osm::OsmProvider::new()),
             Arc::new(photon::PhotonProvider::new()),
@@ -109,6 +115,7 @@ impl ProviderChain {
     /// The default chain configured from a `MapsConfiguration`.
     pub fn with_config(config: &MapsConfiguration) -> Self {
         Self::new(vec![
+            Arc::new(backend::BackendProvider::with_config(config)),
             Arc::new(esri::EsriProvider::with_config(config)),
             Arc::new(osm::OsmProvider::with_config(config)),
             Arc::new(photon::PhotonProvider::with_config(config)),
@@ -137,6 +144,20 @@ impl ProviderChain {
             .iter()
             .find(|p| p.supports_style(style))
             .or_else(|| self.providers.first())
+    }
+
+    /// Every provider that can serve tiles for the given style, in chain
+    /// order. Tile downloads try them in order until one succeeds, so a
+    /// dead backend falls back to the direct providers transparently.
+    pub fn tile_providers_for(
+        &self,
+        style: crate::config::MapStyle,
+    ) -> Vec<Arc<dyn MapProvider>> {
+        self.providers
+            .iter()
+            .filter(|p| p.supports_style(style))
+            .cloned()
+            .collect()
     }
 
     /// Runs `call` on every provider until one succeeds.

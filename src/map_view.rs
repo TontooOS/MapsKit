@@ -146,8 +146,9 @@ struct MapInner {
     camera: MapCamera,
     /// The currently rendered base map style (switchable at runtime).
     style: MapStyle,
-    /// Raw PNG/JPEG tile bytes by key.
-    tiles: HashMap<TileKey, Vec<u8>>,
+    /// Loaded tiles by key, with the winning provider recorded so image
+    /// cache keys always match the bytes (providers fall back per tile).
+    tiles: HashMap<TileKey, TileData>,
     pending: HashSet<TileKey>,
     /// Failed tiles with the time of the last attempt. Entries are
     /// retried after [`TILE_RETRY_AFTER`]; the offline badge shows while
@@ -180,16 +181,6 @@ struct MapInner {
 }
 
 impl MapInner {
-    /// The provider serving base map tiles for the active style.
-    fn tile_provider(&self) -> Arc<dyn crate::providers::MapProvider> {
-        self.chain.tile_provider_for(self.style).cloned().unwrap_or_else(|| {
-            self.chain
-                .tile_provider_for(MapStyle::Standard)
-                .cloned()
-                .expect("chain empty")
-        })
-    }
-
     fn attribution_key(&self) -> &'static str {
         // Attribution follows the active imagery, not the provider name:
         // satellite and dark canvas are Esri services, everything else is
@@ -412,12 +403,19 @@ const TILE_RETRY_AFTER: Duration = Duration::from_secs(8);
 /// prefetch ring.
 const PREFETCH_MARGIN: i64 = 1;
 
+/// One loaded tile: raw PNG/JPEG bytes plus the provider that served
+/// them, so decoded-image cache keys stay exact across fallbacks.
+#[derive(Debug, Clone)]
+struct TileData {
+    bytes: Vec<u8>,
+    provider_name: String,
+    cache_source: String,
+}
+
 /// One tile download for the shared worker pool.
 struct TileJob {
     chain: Arc<ProviderChain>,
     style: MapStyle,
-    provider_name: String,
-    cache_source: String,
     user_agent: String,
     timeout_seconds: u64,
     cache_config: MapsConfiguration,
@@ -452,25 +450,37 @@ fn tile_queue() -> &'static Arc<(Mutex<VecDeque<TileJob>>, Condvar)> {
                     if !still_wanted(&job) {
                         continue;
                     }
-                    let provider = job
-                        .chain
-                        .tile_provider_for(job.style)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            job.chain
-                                .tile_provider_for(MapStyle::Standard)
-                                .cloned()
-                                .expect("chain empty")
-                        });
-                    let cache =
-                        TileCache::new(&job.cache_config, &job.provider_name, &job.cache_source);
-                    let result = tiles::fetch_tile(
-                        provider.as_ref(),
-                        &cache,
-                        job.key,
-                        &job.user_agent,
-                        job.timeout_seconds,
-                    );
+                    // Try every tile-capable provider in chain order: the
+                    // backend first, transparently falling back to the
+                    // direct providers when it is unreachable. Each
+                    // provider has its own disk cache namespace.
+                    let mut downloaded: Option<TileData> = None;
+                    let mut last_error = String::from("no tile provider configured");
+                    for provider in job.chain.tile_providers_for(job.style) {
+                        let source = tiles::cache_source_key(provider.as_ref());
+                        let cache = TileCache::new(
+                            &job.cache_config,
+                            provider.name(),
+                            &source,
+                        );
+                        match tiles::fetch_tile(
+                            provider.as_ref(),
+                            &cache,
+                            job.key,
+                            &job.user_agent,
+                            job.timeout_seconds,
+                        ) {
+                            Ok(bytes) => {
+                                downloaded = Some(TileData {
+                                    bytes,
+                                    provider_name: provider.name().to_string(),
+                                    cache_source: source,
+                                });
+                                break;
+                            }
+                            Err(e) => last_error = e.to_string(),
+                        }
+                    }
                     let Some(shared) = job.target.upgrade() else {
                         continue;
                     };
@@ -484,16 +494,16 @@ fn tile_queue() -> &'static Arc<(Mutex<VecDeque<TileJob>>, Condvar)> {
                         continue;
                     }
                     s.pending.remove(&job.key);
-                    match result {
-                        Ok(bytes) => {
-                            s.tiles.insert(job.key, bytes);
+                    match downloaded {
+                        Some(tile) => {
+                            s.tiles.insert(job.key, tile);
                             s.failed.remove(&job.key);
                         }
-                        Err(e) => {
+                        None => {
                             s.failed.insert(job.key, Instant::now());
                             log_debug(&format!(
                                 "tile {}/{}/{} failed: {}",
-                                job.key.z, job.key.x, job.key.y, e
+                                job.key.z, job.key.x, job.key.y, last_error
                             ));
                         }
                     }
@@ -596,17 +606,13 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
             (vis_max_y + PREFETCH_MARGIN).min(world_max),
         );
 
-        let provider = s.tile_provider();
-        let cache_source = tiles::cache_source_key(provider.as_ref());
-        let provider_name = provider.name().to_string();
-        let snapshot = (
+        let (chain, style, user_agent, timeout_seconds, cache_config) = (
             s.chain.clone(),
             s.style,
             s.config.user_agent.clone(),
             s.config.timeout_seconds,
             s.config.clone(),
         );
-        let (chain, style, user_agent, timeout_seconds, cache_config) = snapshot;
 
         let mut jobs = Vec::new();
         for ty in min_y..=max_y {
@@ -626,8 +632,6 @@ fn request_visible_tiles(shared: &Arc<Mutex<MapInner>>) {
                 jobs.push(TileJob {
                     chain: chain.clone(),
                     style,
-                    provider_name: provider_name.clone(),
-                    cache_source: cache_source.clone(),
                     user_agent: user_agent.clone(),
                     timeout_seconds,
                     cache_config: cache_config.clone(),
@@ -690,7 +694,7 @@ const OVERZOOM_PARENT_LEVELS: u8 = 4;
 /// tile exactly, which keeps the map flawless while zooming instead of
 /// flashing placeholders.
 fn parent_fallback(
-    tiles: &HashMap<TileKey, Vec<u8>>,
+    tiles: &HashMap<TileKey, TileData>,
     z: u8,
     tx: u32,
     ty: u32,
@@ -758,18 +762,15 @@ fn draw_tiles(
     let min_ty = (origin_y / TILE_SIZE).floor().max(0.0) as i64;
     let max_ty = (((origin_y + inner.height) / TILE_SIZE).floor() as i64).min(max_tiles - 1);
 
-    let provider = inner.tile_provider();
-    let source = tiles::cache_source_key(provider.as_ref());
-    let provider_name = provider.name().to_string();
-
     for ty in min_ty..=max_ty {
         for tx in min_tx..=max_tx {
             let key = TileKey::new(z, tx as u32, ty as u32);
             let lx = ox + (tx as f64 * TILE_SIZE - origin_x) * zoom_scale;
             let ly = oy + (ty as f64 * TILE_SIZE - origin_y) * zoom_scale;
-            if let Some(bytes) = inner.tiles.get(&key) {
-                let cache_key = tile_image_key(&provider_name, &source, key);
-                draw_tile_image(scene, images, &cache_key, bytes, lx, ly, tile_draw, dpr);
+            if let Some(tile) = inner.tiles.get(&key) {
+                let cache_key =
+                    tile_image_key(&tile.provider_name, &tile.cache_source, key);
+                draw_tile_image(scene, images, &cache_key, &tile.bytes, lx, ly, tile_draw, dpr);
                 continue;
             }
             // Overzoom: reuse a loaded parent tile scaled up so zooming
@@ -777,8 +778,9 @@ fn draw_tiles(
             if let Some((parent, off_x, off_y, shift)) =
                 parent_fallback(&inner.tiles, z, tx as u32, ty as u32)
             {
-                if let Some(bytes) = inner.tiles.get(&parent) {
-                    let cache_key = tile_image_key(&provider_name, &source, parent);
+                if let Some(tile) = inner.tiles.get(&parent) {
+                    let cache_key =
+                        tile_image_key(&tile.provider_name, &tile.cache_source, parent);
                     // The parent covers 2^shift sub-tiles per axis; draw it
                     // large and clip to this tile's rect.
                     let clip = vello::kurbo::Rect::new(
@@ -792,7 +794,7 @@ fn draw_tiles(
                         scene,
                         images,
                         &cache_key,
-                        bytes,
+                        &tile.bytes,
                         lx - off_x as f64 * tile_draw,
                         ly - off_y as f64 * tile_draw,
                         tile_draw * f64::from(1u32 << shift),
@@ -808,13 +810,14 @@ fn draw_tiles(
                 let mut covered = false;
                 for (qx, qy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                     let child = TileKey::new(z + 1, tx as u32 * 2 + qx, ty as u32 * 2 + qy);
-                    if let Some(bytes) = inner.tiles.get(&child) {
-                        let cache_key = tile_image_key(&provider_name, &source, child);
+                    if let Some(tile) = inner.tiles.get(&child) {
+                        let cache_key =
+                            tile_image_key(&tile.provider_name, &tile.cache_source, child);
                         draw_tile_image(
                             scene,
                             images,
                             &cache_key,
-                            bytes,
+                            &tile.bytes,
                             lx + qx as f64 * tile_draw / 2.0,
                             ly + qy as f64 * tile_draw / 2.0,
                             tile_draw / 2.0,
@@ -1810,13 +1813,25 @@ mod tests {
         assert!(tile_in_load_range(center, 3, 1.0, 800.0, 600.0, TileKey::new(2, 0, 0)));
     }
 
+    fn test_tiles(pairs: &[(u8, u32, u32)]) -> HashMap<TileKey, TileData> {
+        pairs
+            .iter()
+            .map(|(z, x, y)| {
+                (
+                    TileKey::new(*z, *x, *y),
+                    TileData {
+                        bytes: vec![1],
+                        provider_name: "test".into(),
+                        cache_source: "test".into(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn parent_fallback_finds_nearest_loaded_parent() {
-        let mut tiles = HashMap::new();
-        // Missing tile 10/8/4: parent at z9 is (4, 2), grandparent at z8
-        // is (2, 1).
-        tiles.insert(TileKey::new(8, 2, 1), vec![1]);
-        tiles.insert(TileKey::new(9, 4, 2), vec![2]);
+        let mut tiles = test_tiles(&[(8, 2, 1), (9, 4, 2)]);
         // Nearest parent wins with the sub-tile offset inside it.
         assert_eq!(
             parent_fallback(&tiles, 10, 8, 4),
@@ -1838,9 +1853,8 @@ mod tests {
 
     #[test]
     fn parent_fallback_respects_depth_and_emptiness() {
-        let mut tiles = HashMap::new();
         // Only a z0 world tile: reachable within 4 levels from z4.
-        tiles.insert(TileKey::new(0, 0, 0), vec![1]);
+        let tiles = test_tiles(&[(0, 0, 0)]);
         assert_eq!(
             parent_fallback(&tiles, 4, 9, 5),
             Some((TileKey::new(0, 0, 0), 9, 5, 4))

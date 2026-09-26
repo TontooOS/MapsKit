@@ -479,7 +479,7 @@ pub(crate) fn fetch_osrm_route(
     })
 }
 
-fn instruction_from_osrm(step: &Value, road: &str) -> String {
+pub(crate) fn instruction_from_osrm(step: &Value, road: &str) -> String {
     let maneuver = &step["maneuver"];
     let mtype = maneuver["type"].as_str().unwrap_or("");
     let modifier = maneuver["modifier"].as_str().unwrap_or("");
