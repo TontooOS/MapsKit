@@ -4,11 +4,10 @@
 //! `CLLocationCoordinate2D`, `MapRegion` to `MKCoordinateRegion`, `Place` to
 //! `MKMapItem` and `Route` / `RouteStep` to `MKRoute` / `MKRouteStep`.
 
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A geographic coordinate in WGS 84 (degrees).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coordinate {
     pub latitude: f64,
     pub longitude: f64,
@@ -55,7 +54,7 @@ impl fmt::Display for Coordinate {
 }
 
 /// A rectangular map region defined by a center and a lat/lon span.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MapRegion {
     pub center: Coordinate,
     pub span: CoordinateSpan,
@@ -78,7 +77,7 @@ impl MapRegion {
 }
 
 /// The width and height of a map region in degrees.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoordinateSpan {
     pub latitude_delta: f64,
     pub longitude_delta: f64,
@@ -102,7 +101,7 @@ impl CoordinateSpan {
 }
 
 /// A geographic bounding box in degrees.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoundingBox {
     pub north: f64,
     pub south: f64,
@@ -141,7 +140,7 @@ impl BoundingBox {
 
 /// Categories a place can belong to. Each category maps to OpenStreetMap
 /// amenity/shop/leisure tags used by the Overpass provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlaceCategory {
     Restaurant,
     Cafe,
@@ -312,7 +311,7 @@ impl PlaceCategory {
 }
 
 /// A structured postal address.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Address {
     pub street: Option<String>,
     pub house_number: Option<String>,
@@ -351,7 +350,7 @@ impl Address {
 }
 
 /// Extra details for a place, filled by `place_details`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlaceInfo {
     pub phone: Option<String>,
     pub website: Option<String>,
@@ -364,7 +363,7 @@ pub struct PlaceInfo {
 }
 
 /// A point of interest or search result (the MapKit `MKMapItem`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Place {
     /// Stable provider id (`nominatim:12345`, `osm:node/123`, ...).
     pub id: String,
@@ -417,7 +416,7 @@ impl Place {
 }
 
 /// Travel mode for routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TravelMode {
     Driving,
     Walking,
@@ -451,7 +450,7 @@ impl TravelMode {
 }
 
 /// One instruction of a route (the MapKit `MKRouteStep`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteStep {
     /// Human readable instruction, e.g. `"Turn left onto Hauptstraße"`.
     pub instruction: String,
@@ -461,7 +460,7 @@ pub struct RouteStep {
 }
 
 /// A computed route (the MapKit `MKRoute`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Route {
     pub distance_m: f64,
     pub duration_s: f64,

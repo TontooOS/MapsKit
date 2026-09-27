@@ -48,8 +48,8 @@ impl From<networkkit::types::NetworkError> for MapsError {
     }
 }
 
-impl From<serde_json::Error> for MapsError {
-    fn from(e: serde_json::Error) -> Self {
+impl From<foundation::error::FoundationError> for MapsError {
+    fn from(e: foundation::error::FoundationError) -> Self {
         MapsError::Parse(e.to_string())
     }
 }

@@ -2,11 +2,10 @@
 //! service, following Apple's MapKit configuration style.
 
 use crate::types::PlaceCategory;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Visual style of the base map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapStyle {
     /// Light basemap: classic OSM cartography from the Fastly CDN (the
     /// same tiles Leaflet shows by default).

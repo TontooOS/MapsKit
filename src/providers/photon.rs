@@ -15,7 +15,7 @@ use crate::error::MapsError;
 use crate::types::{
     Address, Coordinate, Place, PlaceCategory, PlaceInfo, Route, TravelMode,
 };
-use serde_json::Value;
+use foundation::serialization::JsonValue;
 
 /// Photon + keyless basemap backed provider (fallback).
 pub struct PhotonProvider {
@@ -50,7 +50,7 @@ impl PhotonProvider {
         http_client(&self.user_agent, self.timeout_seconds)
     }
 
-    fn query(&self, params: &[(&str, String)]) -> Result<Value, MapsError> {
+    fn query(&self, params: &[(&str, String)]) -> Result<JsonValue, MapsError> {
         let client = self.client();
         let resp = get_with_query(&client, &format!("{}/api/", self.photon_url), params)?;
         if !resp.is_success() {
@@ -64,39 +64,51 @@ impl PhotonProvider {
 
     fn features_to_places(
         &self,
-        json: &Value,
+        json: &JsonValue,
         reference: Option<Coordinate>,
     ) -> Vec<Place> {
         let mut places = Vec::new();
-        let Some(features) = json["features"].as_array() else {
+        let Some(features) = json.get("features").and_then(|v| v.as_array()) else {
             return places;
         };
         for feature in features {
-            let lon = feature["geometry"]["coordinates"][0].as_f64();
-            let lat = feature["geometry"]["coordinates"][1].as_f64();
+            let lon = feature
+                .get("geometry")
+                .and_then(|g| g.get("coordinates"))
+                .and_then(|c| c.at(0))
+                .and_then(|v| v.as_f64());
+            let lat = feature
+                .get("geometry")
+                .and_then(|g| g.get("coordinates"))
+                .and_then(|c| c.at(1))
+                .and_then(|v| v.as_f64());
             let (Some(lon), Some(lat)) = (lon, lat) else {
                 continue;
             };
             let coordinate = Coordinate::new(lat, lon);
-            let props = &feature["properties"];
-
-            let name = props["name"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let Some(name) = name else { continue };
-
-            let osm_key = props["osm_key"].as_str().unwrap_or("");
-            let osm_value = props["osm_value"].as_str().unwrap_or("");
-            let category =
-                PlaceCategory::from_osm_tag(osm_key, osm_value).unwrap_or(PlaceCategory::Generic);
+            let props = feature.get("properties");
 
             let opt = |key: &str| {
-                props[key]
-                    .as_str()
+                props
+                    .and_then(|p| p.get(key))
+                    .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
             };
+            let name = opt("name");
+            let Some(name) = name else { continue };
+
+            let osm_key = props
+                .and_then(|p| p.get("osm_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let osm_value = props
+                .and_then(|p| p.get("osm_value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let category =
+                PlaceCategory::from_osm_tag(osm_key, osm_value).unwrap_or(PlaceCategory::Generic);
+
             let address = Address {
                 street: opt("street"),
                 house_number: opt("housenumber"),
@@ -108,8 +120,14 @@ impl PhotonProvider {
                 formatted: None,
             };
 
-            let osm_type = props["osm_type"].as_str().unwrap_or("N");
-            let osm_id = props["osm_id"].as_i64().unwrap_or(0);
+            let osm_type = props
+                .and_then(|p| p.get("osm_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("N");
+            let osm_id = props
+                .and_then(|p| p.get("osm_id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let letter = match osm_type {
                 "W" => "W",
                 "R" => "R",
@@ -215,17 +233,18 @@ impl MapProvider for PhotonProvider {
                 resp.status
             )));
         }
-        let json: Value = response_json(resp)?;
-        let feature = json["features"]
-            .as_array()
+        let json: JsonValue = response_json(resp)?;
+        let feature = json
+            .get("features")
+            .and_then(|v| v.as_array())
             .and_then(|f| f.first())
-            .cloned()
             .ok_or_else(|| MapsError::Parse("Photon reverse returned no feature".into()))?;
-        let props = &feature["properties"];
+        let props = feature.get("properties");
 
         let opt = |key: &str| {
-            props[key]
-                .as_str()
+            props
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
@@ -377,8 +396,8 @@ mod tests {
     #[test]
     fn parses_features() {
         let p = PhotonProvider::new();
-        let json = serde_json::json!({
-            "features": [{
+        let json = JsonValue::parse(
+            r#"{"features": [{
                 "geometry": { "coordinates": [13.4, 52.52] },
                 "properties": {
                     "name": "Brandenburger Tor",
@@ -390,8 +409,9 @@ mod tests {
                     "country": "Germany",
                     "countrycode": "DE"
                 }
-            }]
-        });
+            }]}"#,
+        )
+        .unwrap();
         let places = p.features_to_places(&json, Some(Coordinate::new(52.0, 13.0)));
         assert_eq!(places.len(), 1);
         assert_eq!(places[0].name, "Brandenburger Tor");

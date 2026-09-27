@@ -12,7 +12,7 @@ use crate::error::MapsError;
 use crate::types::{
     Address, Coordinate, Place, PlaceCategory, PlaceInfo, Route, RouteStep, TravelMode,
 };
-use serde_json::Value;
+use foundation::serialization::JsonValue;
 
 /// OpenStreetMap-backed provider (primary).
 pub struct OsmProvider {
@@ -99,25 +99,32 @@ impl OsmProvider {
                 resp.status
             )));
         }
-        let json: Value = response_json(resp)?;
+        let json: JsonValue = response_json(resp)?;
 
         let mut places = Vec::new();
         if let Some(items) = json.as_array() {
             for item in items {
-                let lat = item["lat"].as_str().and_then(|s| s.parse::<f64>().ok());
-                let lon = item["lon"].as_str().and_then(|s| s.parse::<f64>().ok());
+                let lat = item
+                    .get("lat")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok());
+                let lon = item
+                    .get("lon")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok());
                 let (Some(lat), Some(lon)) = (lat, lon) else {
                     continue;
                 };
                 let coordinate = Coordinate::new(lat, lon);
 
-                let name = item["name"]
-                    .as_str()
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .unwrap_or_else(|| {
-                        item["display_name"]
-                            .as_str()
+                        item.get("display_name")
+                            .and_then(|v| v.as_str())
                             .unwrap_or("Unknown")
                             .split(',')
                             .next()
@@ -128,8 +135,12 @@ impl OsmProvider {
 
                 let category = classify_nominatim(item);
                 let address = parse_nominatim_address(item);
-                let osm_type = item["osm_type"].as_str().unwrap_or("N").to_uppercase();
-                let osm_id = item["osm_id"].as_i64().unwrap_or(0);
+                let osm_type = item
+                    .get("osm_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("N")
+                    .to_uppercase();
+                let osm_id = item.get("osm_id").and_then(|v| v.as_i64()).unwrap_or(0);
                 let id = format!("nominatim:{osm_type}{osm_id}");
 
                 let mut place = Place::new(name, coordinate)
@@ -217,10 +228,13 @@ impl MapProvider for OsmProvider {
                 resp.status
             )));
         }
-        let json: Value = response_json(resp)?;
-        if json["error"].is_object() || json["error"].is_string() {
+        let json: JsonValue = response_json(resp)?;
+        if json.get("error").map(|e| e.is_object() || e.is_string()).unwrap_or(false) {
             return Err(MapsError::Provider(
-                json["error"].as_str().unwrap_or("reverse geocoding failed").into(),
+                json.get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("reverse geocoding failed")
+                    .into(),
             ));
         }
         Ok(parse_nominatim_address(&json))
@@ -253,16 +267,16 @@ impl MapProvider for OsmProvider {
                 resp.status
             )));
         }
-        let json: Value = response_json(resp)?;
-        let item = json.as_array().and_then(|a| a.first()).cloned();
+        let json: JsonValue = response_json(resp)?;
+        let item = json.as_array().and_then(|a| a.first());
         let Some(item) = item else {
             return Ok(place.clone());
         };
 
-        let tags = &item["extratags"];
+        let tags = item.get("extratags");
         let get = |key: &str| {
-            tags[key]
-                .as_str()
+            tags.and_then(|t| t.get(key))
+                .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
@@ -329,25 +343,38 @@ impl MapProvider for OsmProvider {
                 resp.status
             )));
         }
-        let json: Value = response_json(resp)?;
+        let json: JsonValue = response_json(resp)?;
 
         let mut places = Vec::new();
-        if let Some(elements) = json["elements"].as_array() {
+        if let Some(elements) = json.get("elements").and_then(|v| v.as_array()) {
             for element in elements {
-                let lat = element["lat"]
-                    .as_f64()
-                    .or_else(|| element["center"]["lat"].as_f64());
-                let lon = element["lon"]
-                    .as_f64()
-                    .or_else(|| element["center"]["lon"].as_f64());
+                let lat = element
+                    .get("lat")
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| {
+                        element
+                            .get("center")
+                            .and_then(|c| c.get("lat"))
+                            .and_then(|v| v.as_f64())
+                    });
+                let lon = element
+                    .get("lon")
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| {
+                        element
+                            .get("center")
+                            .and_then(|c| c.get("lon"))
+                            .and_then(|v| v.as_f64())
+                    });
                 let (Some(lat), Some(lon)) = (lat, lon) else {
                     continue;
                 };
                 let coordinate = Coordinate::new(lat, lon);
-                let tags = &element["tags"];
+                let tags = element.get("tags");
 
-                let name = tags["name"]
-                    .as_str()
+                let name = tags
+                    .and_then(|t| t.get("name"))
+                    .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
                 let Some(name) = name else {
@@ -355,8 +382,8 @@ impl MapProvider for OsmProvider {
                 };
 
                 let mut category = PlaceCategory::Generic;
-                if let Some(tags) = tags.as_object() {
-                    for (key, value) in tags {
+                if let Some(entries) = tags.and_then(|t| t.object_entries()) {
+                    for (key, value) in entries {
                         let Some(value) = value.as_str() else {
                             continue;
                         };
@@ -368,8 +395,8 @@ impl MapProvider for OsmProvider {
                 }
 
                 let get = |key: &str| {
-                    tags[key]
-                        .as_str()
+                    tags.and_then(|t| t.get(key))
+                        .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
                 };
@@ -394,8 +421,11 @@ impl MapProvider for OsmProvider {
                     operator: get("operator"),
                 };
 
-                let osm_type = element["type"].as_str().unwrap_or("node");
-                let osm_id = element["id"].as_i64().unwrap_or(0);
+                let osm_type = element
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("node");
+                let osm_id = element.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
                 let letter = match osm_type {
                     "way" => "W",
                     "relation" => "R",
@@ -467,44 +497,61 @@ pub(crate) fn fetch_osrm_route(
             resp.status
         )));
     }
-    let json: Value = response_json(resp)?;
+    let json: JsonValue = response_json(resp)?;
 
-    if json["code"].as_str() != Some("Ok") {
+    if json.get("code").and_then(|v| v.as_str()) != Some("Ok") {
         return Err(MapsError::Provider(format!(
             "OSRM code: {}",
-            json["code"].as_str().unwrap_or("unknown")
+            json.get("code").and_then(|v| v.as_str()).unwrap_or("unknown")
         )));
     }
 
-    let route = json["routes"]
-        .as_array()
+    let route = json
+        .get("routes")
+        .and_then(|v| v.as_array())
         .and_then(|r| r.first())
         .ok_or_else(|| MapsError::Parse("OSRM response has no routes".into()))?;
 
-    let distance_m = route["distance"].as_f64().unwrap_or(0.0);
-    let duration_s = route["duration"].as_f64().unwrap_or(0.0);
+    let distance_m = route.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let duration_s = route.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
     let mut geometry = Vec::new();
-    if let Some(coords) = route["geometry"]["coordinates"].as_array() {
+    if let Some(coords) = route
+        .get("geometry")
+        .and_then(|g| g.get("coordinates"))
+        .and_then(|v| v.as_array())
+    {
         for pair in coords {
-            if let (Some(lon), Some(lat)) = (pair[0].as_f64(), pair[1].as_f64()) {
+            if let (Some(lon), Some(lat)) =
+                (pair.at(0).and_then(|v| v.as_f64()), pair.at(1).and_then(|v| v.as_f64()))
+            {
                 geometry.push(Coordinate::new(lat, lon));
             }
         }
     }
 
     let mut steps = Vec::new();
-    if let Some(legs) = route["legs"].as_array() {
+    if let Some(legs) = route.get("legs").and_then(|v| v.as_array()) {
         for leg in legs {
-            if let Some(leg_steps) = leg["steps"].as_array() {
+            if let Some(leg_steps) = leg.get("steps").and_then(|v| v.as_array()) {
                 for step in leg_steps {
-                    let lon = step["maneuver"]["location"][0].as_f64().unwrap_or(0.0);
-                    let lat = step["maneuver"]["location"][1].as_f64().unwrap_or(0.0);
-                    let road = step["name"].as_str().unwrap_or("").to_string();
+                    let lon = step
+                        .get("maneuver")
+                        .and_then(|m| m.get("location"))
+                        .and_then(|l| l.at(0))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let lat = step
+                        .get("maneuver")
+                        .and_then(|m| m.get("location"))
+                        .and_then(|l| l.at(1))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let road = step.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     steps.push(RouteStep {
                         instruction: instruction_from_osrm(step, &road),
-                        distance_m: step["distance"].as_f64().unwrap_or(0.0),
-                        duration_s: step["duration"].as_f64().unwrap_or(0.0),
+                        distance_m: step.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        duration_s: step.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         coordinate: Coordinate::new(lat, lon),
                     });
                 }
@@ -521,10 +568,16 @@ pub(crate) fn fetch_osrm_route(
     })
 }
 
-fn instruction_from_osrm(step: &Value, road: &str) -> String {
-    let maneuver = &step["maneuver"];
-    let mtype = maneuver["type"].as_str().unwrap_or("");
-    let modifier = maneuver["modifier"].as_str().unwrap_or("");
+fn instruction_from_osrm(step: &JsonValue, road: &str) -> String {
+    let maneuver = step.get("maneuver");
+    let mtype = maneuver
+        .and_then(|m| m.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let modifier = maneuver
+        .and_then(|m| m.get("modifier"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let turn_word = match modifier {
         "left" => "Turn left",
@@ -575,9 +628,9 @@ fn instruction_from_osrm(step: &Value, road: &str) -> String {
 }
 
 /// Classifies a Nominatim result by its `class`/`type` pair.
-fn classify_nominatim(item: &Value) -> PlaceCategory {
-    let class = item["class"].as_str().unwrap_or("");
-    let typ = item["type"].as_str().unwrap_or("");
+fn classify_nominatim(item: &JsonValue) -> PlaceCategory {
+    let class = item.get("class").and_then(|v| v.as_str()).unwrap_or("");
+    let typ = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
     PlaceCategory::from_osm_tag(class, typ).unwrap_or(match (class, typ) {
         ("highway", "bus_stop") => PlaceCategory::BusStop,
         ("place", _) => PlaceCategory::Generic,
@@ -587,11 +640,11 @@ fn classify_nominatim(item: &Value) -> PlaceCategory {
 }
 
 /// Parses the `address` object of a Nominatim jsonv2 response.
-fn parse_nominatim_address(item: &Value) -> Address {
-    let addr = &item["address"];
+fn parse_nominatim_address(item: &JsonValue) -> Address {
+    let addr = item.get("address");
     let get = |key: &str| {
-        addr[key]
-            .as_str()
+        addr.and_then(|a| a.get(key))
+            .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
@@ -606,8 +659,9 @@ fn parse_nominatim_address(item: &Value) -> Address {
         state: get("state"),
         country: get("country"),
         country_code: get("country_code"),
-        formatted: item["display_name"]
-            .as_str()
+        formatted: item
+            .get("display_name")
+            .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     }
@@ -650,21 +704,21 @@ mod tests {
 
     #[test]
     fn instructions() {
-        let step = serde_json::json!({
-            "maneuver": { "type": "turn", "modifier": "left", "location": [13.4, 52.5] },
-            "name": "Hauptstraße",
-            "distance": 120.0,
-            "duration": 30.0
-        });
+        let step = JsonValue::parse(
+            r#"{"maneuver": { "type": "turn", "modifier": "left", "location": [13.4, 52.5] },
+                "name": "Hauptstraße", "distance": 120.0, "duration": 30.0}"#,
+        )
+        .unwrap();
         assert_eq!(
             instruction_from_osrm(&step, "Hauptstraße"),
             "Turn left onto Hauptstraße"
         );
 
-        let depart = serde_json::json!({
-            "maneuver": { "type": "depart", "modifier": "", "location": [0.0, 0.0] },
-            "name": ""
-        });
+        let depart = JsonValue::parse(
+            r#"{"maneuver": { "type": "depart", "modifier": "", "location": [0.0, 0.0] },
+                "name": ""}"#,
+        )
+        .unwrap();
         assert_eq!(instruction_from_osrm(&depart, ""), "Start");
     }
 
@@ -675,7 +729,7 @@ mod tests {
 
     #[test]
     fn classify() {
-        let item = serde_json::json!({ "class": "amenity", "type": "restaurant" });
+        let item = JsonValue::parse(r#"{"class": "amenity", "type": "restaurant"}"#).unwrap();
         assert_eq!(classify_nominatim(&item), PlaceCategory::Restaurant);
     }
 

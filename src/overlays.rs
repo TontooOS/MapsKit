@@ -2,10 +2,9 @@
 //! Apple's `MKAnnotation`, `MKPolyline`, `MKPolygon` and `MKCircle`.
 
 use crate::types::{Coordinate, Place};
-use serde::{Deserialize, Serialize};
 
 /// A pin on the map (`MKPointAnnotation`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     pub id: String,
     pub coordinate: Coordinate,
@@ -14,7 +13,6 @@ pub struct Annotation {
     /// Glyph name shown inside the pin (SF Symbol name).
     pub glyph: Option<String>,
     /// Whether this annotation is selected (drawn highlighted).
-    #[serde(default)]
     pub selected: bool,
 }
 
@@ -57,7 +55,7 @@ impl Annotation {
 }
 
 /// A line drawn between points (`MKPolyline`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Polyline {
     pub id: String,
     pub points: Vec<Coordinate>,
@@ -94,7 +92,7 @@ impl Polyline {
 }
 
 /// A filled shape (`MKPolygon`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Polygon {
     pub id: String,
     pub points: Vec<Coordinate>,
@@ -131,7 +129,7 @@ impl Polygon {
 }
 
 /// A radius circle around a center (`MKCircle`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CircleOverlay {
     pub id: String,
     pub center: Coordinate,
@@ -164,7 +162,7 @@ impl CircleOverlay {
 }
 
 /// Any overlay that can be added to a map view.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     Polyline(Polyline),
     Polygon(Polygon),

@@ -236,25 +236,27 @@ pub(crate) fn http_client(
         .timeout(std::time::Duration::from_secs(timeout_seconds))
 }
 
-/// Blocking GET with URL-encoded query pairs.
+/// Blocking GET with URL-encoded query pairs (Foundation URL encoding,
+/// matching the former `url` crate behavior).
 pub(crate) fn get_with_query(
     client: &networkkit::http::HttpClient,
     base: &str,
     params: &[(&str, String)],
 ) -> Result<networkkit::http::HttpResponse, MapsError> {
-    let mut url =
-        url::Url::parse(base).map_err(|e| MapsError::InvalidQuery(e.to_string()))?;
+    let mut url = foundation::url::URLComponents::from_str(base)
+        .map_err(|e| MapsError::InvalidQuery(e.to_string()))?;
     for (key, value) in params {
-        url.query_pairs_mut().append_pair(key, value);
+        url.append_query_pair(key, value);
     }
-    client.get(url.as_str()).send().map_err(MapsError::from)
+    client.get(&url.string()).send().map_err(MapsError::from)
 }
 
-/// Parses a response body as JSON.
+/// Parses a response body as JSON (any root: object, array or scalar).
 pub(crate) fn response_json(
     resp: networkkit::http::HttpResponse,
-) -> Result<serde_json::Value, MapsError> {
-    resp.json().map_err(MapsError::from)
+) -> Result<foundation::serialization::JsonValue, MapsError> {
+    let body = resp.text().map_err(MapsError::from)?;
+    foundation::serialization::JsonValue::parse(&body).map_err(MapsError::from)
 }
 
 #[cfg(test)]
