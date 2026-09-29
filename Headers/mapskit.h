@@ -27,7 +27,7 @@ extern "C" {
 /* Version                                                             */
 /* ------------------------------------------------------------------ */
 
-/* The framework version string, e.g. "26.1.0". Static, do not free. */
+/* The framework version string, e.g. "27.0.0". Static, do not free. */
 const char *tontoo_mapskit_version(void);
 
 /* ------------------------------------------------------------------ */

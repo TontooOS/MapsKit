@@ -9,7 +9,7 @@ OpenStreetMap primary, Photon + Esri fallback), so no API keys are required.
 
 - Repository: tontoo-os/TontooLibs/MapsKit
 - License: TCL
-- Version: 26.1.0
+- Version: 27.0.0
 
 ## Feature Index
 

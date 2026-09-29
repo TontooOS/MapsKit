@@ -14,7 +14,7 @@ Link against `/Library/System/mapskit.library` and include the header:
 ```c
 #include "mapskit.h"
 
-const char *version = tontoo_mapskit_version(); /* "26.1.0" */
+const char *version = tontoo_mapskit_version(); /* "27.0.0" */
 ```
 
 ## Services (blocking)
